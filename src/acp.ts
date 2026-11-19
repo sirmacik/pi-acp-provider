@@ -96,6 +96,12 @@ export type AcpSessionUpdate =
 			locations: AcpToolLocation[] | undefined;
 			rawInput: unknown;
 			rawOutput: unknown;
+	  }
+	| {
+			/** `usage_update`: tokens the session's context holds now, and its window when known. */
+			type: "usage_update";
+			used: number;
+			size: number | undefined;
 	  };
 
 export interface AcpToolDiff {
@@ -212,6 +218,13 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 				locations: parseLocations(update.locations),
 				rawInput: update.rawInput,
 				rawOutput: update.rawOutput,
+			};
+		case "usage_update":
+			if (typeof update.used !== "number" || !Number.isFinite(update.used) || update.used < 0) return null;
+			return {
+				type: "usage_update",
+				used: update.used,
+				size: typeof update.size === "number" && update.size > 0 ? update.size : undefined,
 			};
 		default:
 			return null;

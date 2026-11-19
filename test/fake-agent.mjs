@@ -11,6 +11,7 @@
  *   - "REFUSAL"     finishes with stopReason "refusal"
  *   - "ONESHOT"     first reports a tool call that is already completed
  *   - "DIFF"        first reports an edit tool call with a diff
+ *   - "USAGE"       sends usage_update (used 1234) and a summed prompt `usage`
  *   - FAKE_SPLIT=1  writes stdout in small split chunks (line-buffer test)
  *   - FAKE_MODELS=config  session/new returns configOptions (model + thought_level)
  *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
@@ -155,6 +156,14 @@ async function handlePrompt(message) {
 	activePrompt = turn;
 	const stepDelay = text.includes("SLOW") ? 150 : 5;
 
+	if (text.includes("USAGE")) {
+		update(sessionId, { sessionUpdate: "usage_update", used: 1234, size: 200000 });
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } });
+		return reply(message.id, {
+			stopReason: "end_turn",
+			usage: { inputTokens: 10, outputTokens: 20, cachedReadTokens: 30000, cachedWriteTokens: 40, totalTokens: 30070 },
+		});
+	}
 	if (text === "/context") {
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "context: 42%" } });
 		return turn.finish("end_turn");

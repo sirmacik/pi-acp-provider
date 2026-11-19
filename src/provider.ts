@@ -154,13 +154,19 @@ const zeroUsage = (): Usage => ({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 });
 
-function addUsage(total: Usage, usage: AcpUsage | undefined): void {
-	if (!usage) return;
-	total.input += usage.input;
-	total.output += usage.output;
-	total.cacheRead += usage.cacheRead;
-	total.cacheWrite += usage.cacheWrite;
-	total.totalTokens = total.input + total.output + total.cacheRead + total.cacheWrite;
+/**
+ * WARN: an ACP prompt result sums the usage of every model call in the turn, and each call re-reads the
+ * whole context, so the sum overstates the context many times. Pi reads `totalTokens` as the context
+ * size, so it takes the agent's `usage_update.used` instead when the agent sent one.
+ */
+function addUsage(total: Usage, usage: AcpUsage | undefined, contextUsed?: number): void {
+	if (usage) {
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+	}
+	total.totalTokens = contextUsed ?? total.input + total.output + total.cacheRead + total.cacheWrite;
 }
 
 /** Decides a `session/request_permission`; `signal` aborts when the turn is cancelled. */
@@ -323,6 +329,8 @@ interface LiveTurn {
 	tools: Map<string, ToolEntry>;
 	piCalls: Map<string, PiCall>;
 	usage: Usage;
+	/** The agent's latest `usage_update.used`: what its context holds now. */
+	contextUsed: number | undefined;
 	onRawUpdate: ((params: unknown) => void) | undefined;
 }
 
@@ -708,6 +716,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			tools: new Map(),
 			piCalls: new Map(),
 			usage: zeroUsage(),
+			contextUsed: undefined,
 			onRawUpdate,
 		};
 		live = turn;
@@ -808,6 +817,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** Records an update, then hands it to the attached message or buffers it for the next one. */
 	function dispatch(turn: LiveTurn, event: TurnEvent): void {
+		if (event.type === "usage_update") {
+			turn.contextUsed = event.used;
+			return;
+		}
 		if (event.type === "tool_call" || event.type === "tool_call_update") {
 			let entry = turn.tools.get(event.toolCallId);
 			if (!entry) {
@@ -911,7 +924,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			else if (event.type === "pi_tool_call") {
 				if (!turn.piCalls.has(event.id)) return;
 				endAt({ type: "toolCall", id: event.id, name: event.name, arguments: event.arguments as ToolCall["arguments"] });
-			} else {
+			} else if (event.type === "tool_call" || event.type === "tool_call_update") {
 				const entry = turn.tools.get(event.toolCallId);
 				if (!entry || entry.piOwned) return;
 				if (!turn.native) {
@@ -953,7 +966,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	function settleTurn(turn: LiveTurn, outcome: TurnOutcome): void {
 		turn.running = false;
-		if ("result" in outcome && outcome.result.kind === "finished") addUsage(turn.usage, outcome.result.usage);
+		if ("result" in outcome && outcome.result.kind === "finished") addUsage(turn.usage, outcome.result.usage, turn.contextUsed);
 		const next = turn.queued.shift();
 		const cleanEnd = "result" in outcome && outcome.result.kind === "finished" && outcome.result.stopReason === "end_turn";
 		if (next && cleanEnd && !turn.controller.signal.aborted) {
@@ -996,18 +1009,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			if (others.length > 0) blocks.push(tagged("conversation-history", renderTranscript(messages), "The conversation:"));
 			else for (const user of users) blocks.push(...userBlocks(user, info.capabilities.image));
 			stream.push({ type: "start", partial: message });
+			let contextUsed: number | undefined;
 			const result = await client.prompt({
 				sessionId,
 				payload: { sessionId, prompt: blocks },
 				signal,
 				onUpdate: (update) => {
 					if (update.type === "agent_message_chunk") writer.append("text", update.text);
+					else if (update.type === "usage_update") contextUsed = update.used;
 				},
 			});
 			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
 			else {
 				const usage = zeroUsage();
-				addUsage(usage, result.usage);
+				addUsage(usage, result.usage, contextUsed);
 				finishTurn(writer, agent, result.stopReason, usage);
 			}
 		} catch (error) {

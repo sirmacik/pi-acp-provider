@@ -111,6 +111,15 @@ test("happy path: ordered events, balanced blocks, zero usage", async () => {
 	assert.match(text, /Hello world #\d+/);
 });
 
+test("context size comes from usage_update, not the turn's summed usage", async () => {
+	const handle = makeProvider();
+	const last = await lastEvent(handle, "USAGE please");
+	assert.ok(last?.type === "done");
+	const { usage } = last.message;
+	assert.equal(usage.totalTokens, 1234);
+	assert.deepEqual([usage.input, usage.output, usage.cacheRead, usage.cacheWrite], [10, 20, 30000, 40]);
+});
+
 test("agents run as separate processes with separate sessions", async () => {
 	const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
 	const [fake, other] = handle.provider.getModels();
