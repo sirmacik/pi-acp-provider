@@ -108,7 +108,7 @@ and Mistral Vibe): `piTools: "both"`, `mcpTransport: "stdio"`,
 
 | Command | Preset |
 |---|---|
-| `claude-agent-acp` | `piTools: "pi"` (`tools: []` and `strictMcpConfig` via `_meta.claudeCode.options`), `mcpTransport: "http"`, `systemPrompt: "session"`, `allowedTools: ["mcp__pi"]`, env `ENABLE_CLAUDEAI_MCP_SERVERS=0` (no claude.ai cloud connectors) |
+| `claude-agent-acp` | `piTools: "pi"` (`tools: []` and `strictMcpConfig` via `_meta.claudeCode.options`), `mcpTransport: "http"`, `systemPrompt: "session"`, `allowedTools: ["mcp__pi"]`, env `ENABLE_CLAUDEAI_MCP_SERVERS=0` (no claude.ai cloud connectors) and `DISABLE_AUTO_COMPACT=1` (Pi owns compaction; also stops the adapter's idle compaction) |
 | `codex-acp` | `piTools: "both"`, `mcpTransport: "http"`, `systemPrompt: "session"` |
 
 Global keys:
