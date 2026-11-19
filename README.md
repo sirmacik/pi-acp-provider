@@ -21,10 +21,12 @@ GitHub Copilot CLI, Gemini CLI, or any other command that speaks ACP over stdio.
 └────────────────────────────────────────────────────────┘
 ```
 
-Instead of Pi running its own LLM tool loop, the ACP agent does the work, the
-same way Zed uses ACP agents: it plans, edits files, runs commands, and streams
-progress back. Pi's own tools are bypassed. The agent runs everything itself
-in the session working directory.
+The ACP agent runs the loop, the same way Zed uses ACP agents: it plans, edits
+files, runs commands, and streams progress back. Pi still provides what it
+provides to any model: its tools (served to the agent over MCP and run by Pi,
+with Pi's approvals, hooks and tool rows), its system prompt (context files,
+skills, extension sections), its message queue (steering and follow-ups), and
+its history (resumed and forked sessions, model switches).
 
 ## Install
 
@@ -91,6 +93,23 @@ Per-agent keys:
 | `name` | no | Display name in the model picker and messages. Default: the key. |
 | `env` | no | Extra environment variables for the agent process. |
 | `authMethod` | no | ACP `authenticate` method id to use when the agent reports `auth_required` (see Auth below). |
+| `piTools` | no | `both` (Pi's tools next to the agent's own), `pi` (Pi's tools only; needs `ownToolsOffMeta`), or `off`. |
+| `mcpTransport` | no | `stdio` or `http` for Pi's MCP server. `http` falls back to stdio when the agent does not advertise it. |
+| `systemPrompt` | no | `prompt` (in front of the first prompt), `session` (ACP `systemPrompt` on `session/new`; falls back to `prompt`), or `off`. |
+| `sessionMeta` | no | Extra `_meta` for `session/new`, merged over the preset. |
+| `ownToolsOffMeta` | no | `_meta` that turns off the agent's own tools, merged in only with `piTools: "pi"`. |
+
+#### Defaults and presets
+
+Agents start from what every ACP agent supports (the level of Antigravity
+and Mistral Vibe): `piTools: "both"`, `mcpTransport: "stdio"`,
+`systemPrompt: "prompt"`. Two commands get a preset; any key in settings wins
+(`env`, `sessionMeta` and `ownToolsOffMeta` merge key by key):
+
+| Command | Preset |
+|---|---|
+| `claude-agent-acp` | `piTools: "pi"` (`tools: []` and `strictMcpConfig` via `_meta.claudeCode.options`), `mcpTransport: "http"`, `systemPrompt: "session"`, `allowedTools: ["mcp__pi"]`, env `ENABLE_CLAUDEAI_MCP_SERVERS=0` (no claude.ai cloud connectors) |
+| `codex-acp` | `piTools: "both"`, `mcpTransport: "http"`, `systemPrompt: "session"` |
 
 Global keys:
 
@@ -109,9 +128,35 @@ Global keys:
   whole tree (including tool subprocesses) is killed. Parent signal hooks,
   shared by all agents, cover exits without a session shutdown. A crashed
   agent is respawned with a fresh session on the next prompt.
-- **Session mapping**: one ACP session per Pi session per agent. Each Pi model
-  turn sends only the new user message, because the agent keeps conversation
-  history on its side. Image attachments are noted but not forwarded.
+- **Session mapping**: one ACP session per Pi session per agent. The agent
+  keeps the conversation on its side, so each prompt carries only what it has
+  not seen: every queued user message (with images, when the agent accepts
+  them), plus a `<conversation-history>` transcript of any part of Pi's
+  history the session missed (a resumed or forked Pi session, another
+  model's turns, a branch the session did not see). When Pi's history no
+  longer holds the session's latest reply (tree navigation to an earlier
+  point) or its first message changed (compaction), the provider starts a new
+  ACP session from Pi's history.
+- **Pi's tools**: Pi's current tools are served by an MCP server inside Pi,
+  as the server `pi` (`mcp__pi__<tool>` in Claude Code). A call ends the Pi
+  message with a real Pi tool call; Pi runs it and the result answers the
+  agent's MCP request, and the ACP turn continues. A changed loadout is served
+  on the next `tools/list` (stdio connections also get `list_changed`).
+  The HTTP transport listens on 127.0.0.1 and the stdio relay uses a socket in
+  a private temp directory; both need a per-process random token. Permission
+  requests for Pi's tools are approved, since Pi applies its own approval
+  when it runs them.
+- **System prompt**: Pi's system prompt goes to each ACP session once (see
+  `systemPrompt`), and a changed prompt is sent with the next prompt.
+- **Queue and steering**: a message Pi queues while the agent works reaches
+  the running turn with `_session/steering` when the agent advertises it
+  (Claude Code, Codex). Otherwise it rides on the Pi tool result the agent is
+  waiting for, or, when none is pending, is sent as the next prompt once the
+  running one ends. The running turn is not cancelled.
+- **Isolated requests**: compaction and branch summaries (`cacheRetention:
+  "none"`) run in a separate, throwaway agent process, so the live session
+  is not touched. Cache-warming requests are answered without contacting the
+  agent.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
   maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other
   update kinds (plans, mode changes) are ignored.
@@ -142,15 +187,20 @@ Global keys:
   CLI or pick a method. A missing command reports a not-found hint naming the
   agent. The provider registers as ambient-auth so `/model` selection never
   blocks.
-- **Usage**: ACP does not report per-turn token usage, so the provider records
-  zeros.
+- **Usage**: token counts come from the `usage` of the `session/prompt`
+  result when the agent reports it (unstable ACP field), summed over the
+  ACP turn and recorded on its last Pi message. Cost is zero.
 
 ### Known limitations
 
-- No image input (prompts are sent as text only).
-- `/resume` and `/fork` start a fresh ACP session. Prior Pi history is not
-  replayed to the agent, and switching models mid-conversation does not carry
-  history across agents.
+- History the agent missed is sent as a plain-text transcript, not as native
+  records: thinking, images and full tool outputs are left out or clipped.
+- How an agent titles calls to Pi's MCP server is matched by pattern (the four
+  agents above were checked). An unrecognized title is shown as an extra
+  `acp_tool` row next to Pi's own row for the same call.
+- Agents may time out long MCP calls on their side (for example while a Pi
+  tool waits on the user). Claude Code's limit is effectively unbounded;
+  other agents were not measured.
 - No ACP client capabilities (`fs`, `terminal`) are offered, so agents use
   their own file and terminal tools. Other agent→client requests get
   method-not-found.
@@ -174,5 +224,7 @@ real agent or network is needed.
 - `src/acp.ts`: ACP v1 / JSON-RPC wire types and boundary parsers
 - `src/acp-client.ts`: child process, NDJSON transport, handshake, sessions, auth
 - `src/provider.ts`: the Pi `Provider` (agents and their discovered models), model and thinking-level selection, and event translation
-- `src/config.ts`: settings and env resolution
+- `src/config.ts`: settings, env resolution, and agent presets
+- `src/mcp-server.ts`, `src/mcp-relay.mjs`: Pi's MCP server (HTTP and stdio relay)
+- `src/transcript.ts`: Pi messages to ACP prompt blocks and history transcripts
 - `src/index.ts`: extension factory (`pi.registerProvider`, lifecycle wiring)

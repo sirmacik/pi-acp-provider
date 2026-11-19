@@ -20,8 +20,19 @@
  *   - FAKE_PROTOCOL=n answers initialize with protocol version n
  *   - FAKE_AUTH=1   session/new fails with auth_required until `authenticate`
  *                   is called with methodId "fake-login"
+ *   - "ECHO"        replies "ECHO[<session id>]<<<full prompt text>>>" and ends the turn
+ *   - "SESSIONINFO" replies with JSON of the session's session/new params
+ *   - "MCPCALL:<tool>:<json args>"  reports a tool call titled "mcp__pi__<tool>",
+ *                   calls <tool> on the session's MCP server (stdio or http),
+ *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
+ *                   when a _session/steering message arrived meanwhile)
+ *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
+ *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
+ *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
+ *   - FAKE_STEERING=1    advertises and accepts `_session/steering`
  */
 
+import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
 const SPLIT = process.env.FAKE_SPLIT === "1";
@@ -79,6 +90,48 @@ let promptCounter = 0;
 let serverRequestId = 0;
 const serverRequestWaiters = new Map();
 let activePrompt = null;
+const sessionParams = new Map();
+const steered = [];
+
+/** A tiny MCP client: initialize, tools/list, tools/call against one ACP McpServer entry. */
+async function mcpCall(server, name, args) {
+	const init = { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-agent", version: "0" } };
+	if (server.type === "http") {
+		const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+		for (const header of server.headers ?? []) headers[header.name] = header.value;
+		const post = async (body) => {
+			const response = await fetch(server.url, { method: "POST", headers, body: JSON.stringify(body) });
+			return response.status === 202 ? null : response.json();
+		};
+		await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: init });
+		await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+		const list = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+		const call = await post({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } });
+		return { tools: list.result.tools, result: call.result };
+	}
+	const env = { ...process.env };
+	for (const entry of server.env ?? []) env[entry.name] = entry.value;
+	const child = spawn(server.command, server.args, { env, stdio: ["pipe", "pipe", "inherit"] });
+	const waiters = new Map();
+	createInterface({ input: child.stdout }).on("line", (line) => {
+		const message = JSON.parse(line);
+		waiters.get(message.id)?.(message);
+	});
+	const request = (id, method, params) =>
+		new Promise((resolve) => {
+			waiters.set(id, resolve);
+			child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+		});
+	try {
+		await request(1, "initialize", init);
+		child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+		const list = await request(2, "tools/list", {});
+		const call = await request(3, "tools/call", { name, arguments: args });
+		return { tools: list.result.tools, result: call.result };
+	} finally {
+		child.kill();
+	}
+}
 
 function serverRequest(method, params) {
 	return new Promise((resolve) => {
@@ -104,6 +157,37 @@ async function handlePrompt(message) {
 
 	if (text === "/context") {
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "context: 42%" } });
+		return turn.finish("end_turn");
+	}
+	if (text.includes("ECHO")) {
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>` } });
+		promptCounter++;
+		return turn.finish("end_turn");
+	}
+	if (text.includes("SESSIONINFO")) {
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(sessionParams.get(sessionId) ?? null) } });
+		return turn.finish("end_turn");
+	}
+	const mcpMatch = /MCPCALL:([\w-]+):(\{.*?\})(?:$|\s)/.exec(text);
+	if (mcpMatch) {
+		const [, tool, json] = mcpMatch;
+		const args = JSON.parse(json);
+		update(sessionId, { sessionUpdate: "tool_call", toolCallId: "m1", title: process.env.FAKE_MCP_TITLE ?? `mcp__pi__${tool}`, status: "pending", rawInput: args });
+		await sleep(20);
+		const server = (sessionParams.get(sessionId)?.mcpServers ?? []).find((entry) => entry.name === "pi");
+		if (!server) {
+			update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NO-MCP-SERVER" } });
+			return turn.finish("end_turn");
+		}
+		const { tools, result } = await mcpCall(server, tool, args);
+		update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "m1", status: result.isError ? "failed" : "completed" });
+		const resultText = (result.content ?? []).map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("|");
+		const extra = steered.length > 0 ? ` STEERED<<<${steered.splice(0).join("|")}>>>` : "";
+		update(sessionId, {
+			sessionUpdate: "agent_message_chunk",
+			content: { type: "text", text: `TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
+		});
+		promptCounter++;
 		return turn.finish("end_turn");
 	}
 	if (text.includes("AUTH")) return replyError(message.id, -32000, "Authentication required");
@@ -189,7 +273,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 		case "initialize":
 			reply(message.id, {
 				protocolVersion: Number(process.env.FAKE_PROTOCOL ?? 1),
-				agentCapabilities: { loadSession: false },
+				agentCapabilities: {
+					loadSession: false,
+					promptCapabilities: { image: true },
+					...(process.env.FAKE_MCP_HTTP === "1" ? { mcpCapabilities: { http: true } } : {}),
+					...(process.env.FAKE_SYSPROMPT === "1" ? { sessionCapabilities: { systemPrompt: {} } } : {}),
+				},
+				...(process.env.FAKE_STEERING === "1" ? { _meta: { steering: { supported: true } } } : {}),
 				agentInfo: { name: `fake-agent-${process.pid}`, version: "0.0.1" },
 				authMethods: [{ id: "fake-login", name: "Fake login", description: "Pretend to sign in" }],
 			});
@@ -206,6 +296,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			if (!authenticated) replyError(message.id, -32000, "Authentication required");
 			else {
 				const sessionId = `sess-${++sessionCounter}`;
+				sessionParams.set(sessionId, message.params);
 				reply(message.id, { sessionId, ...sessionExtras() });
 				update(sessionId, {
 					sessionUpdate: "available_commands_update",
@@ -236,6 +327,18 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 		case "session/prompt":
 			void handlePrompt(message);
 			break;
+		case "_session/steering": {
+			if (process.env.FAKE_STEERING !== "1") {
+				replyError(message.id, -32601, "Method not found");
+				break;
+			}
+			const steerText = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
+			if (activePrompt && !activePrompt.finished) {
+				steered.push(steerText);
+				reply(message.id, { outcome: "steered" });
+			} else reply(message.id, { outcome: "promptRequired", reason: "noRunningTurn" });
+			break;
+		}
 		case "session/cancel":
 			activePrompt?.finish("cancelled");
 			break;

@@ -22,15 +22,18 @@ import {
 	parseConfigOptionUpdate,
 	parseInitializeResult,
 	parseNewSessionResult,
+	parsePromptUsage,
 	parseRpcMessage,
 	parseSessionConfig,
 	parseSessionUpdate,
+	parseSteerOutcome,
 	parseStopReason,
 	type AcpAgentInfo,
 	type AcpCommand,
 	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type AcpStopReason,
+	type AcpUsage,
 	type RpcId,
 } from "./acp.ts";
 import type { AcpAgentConfig } from "./config.ts";
@@ -66,7 +69,7 @@ export interface PromptRequest {
 	signal?: AbortSignal | undefined;
 }
 
-export type PromptResult = { kind: "finished"; stopReason: AcpStopReason } | { kind: "aborted" };
+export type PromptResult = { kind: "finished"; stopReason: AcpStopReason; usage: AcpUsage | undefined } | { kind: "aborted" };
 
 /** A JSON-RPC error, either received from the agent or sent back to it. */
 export class AcpRpcError extends Error {
@@ -101,6 +104,8 @@ interface Connection {
 	proc: ChildProcessWithoutNullStreams;
 	state: "starting" | "ready";
 	session: Promise<string> | null;
+	/** `setup.key` the current session was created with; "" for a bare session. */
+	sessionKey: string;
 	/** Whether the current session has received a prompt (and so has history). */
 	sessionUsed: boolean;
 	/** Every session this process created, by session id. */
@@ -116,6 +121,17 @@ export interface EnsureSessionOptions {
 	 * Background work turns it off, since a method may wait on a browser login.
 	 */
 	authenticate?: boolean;
+	/**
+	 * Extra `session/new` params. A current session created with another key is
+	 * replaced while it has no history (e.g. a bare discovery session), and kept
+	 * once it has one.
+	 */
+	setup?: SessionSetup | undefined;
+}
+
+export interface SessionSetup {
+	key: string;
+	params: (info: AcpAgentInfo) => Record<string, unknown>;
 }
 
 /** The session settings Pi controls. */
@@ -236,15 +252,38 @@ export class AcpClient {
 	}
 
 	/** Returns the current ACP session, creating one (and the process) on demand. */
-	async ensureSession({ signal, authenticate = true }: EnsureSessionOptions = {}): Promise<string> {
-		await this.ensureReady(signal);
+	async ensureSession({ signal, authenticate = true, setup }: EnsureSessionOptions = {}): Promise<string> {
+		const info = await this.ensureReady(signal);
 		const conn = this.conn;
 		if (!conn) throw new Error(`${this.options.agent.name} is not running`);
-		conn.session ??= this.newSession(conn, authenticate).catch((error: unknown) => {
-			conn.session = null;
-			throw error;
-		});
+		const key = setup?.key ?? "";
+		if (conn.session && setup && conn.sessionKey !== key && !conn.sessionUsed) conn.session = null;
+		if (!conn.session) {
+			conn.sessionKey = key;
+			const session: Promise<string> = this.newSession(conn, authenticate, setup?.params(info) ?? {}).catch((error: unknown) => {
+				if (conn.session === session) conn.session = null;
+				throw error;
+			});
+			conn.session = session;
+		}
 		return abortable(conn.session, signal);
+	}
+
+	/**
+	 * Injects `prompt` into the running turn with the `_session/steering`
+	 * extension. `promptRequired` means no turn was running and the message
+	 * still needs a `session/prompt`.
+	 */
+	async steer(sessionId: string, prompt: unknown[], signal?: AbortSignal): Promise<"steered" | "promptRequired"> {
+		const result = await abortable(
+			this.request(
+				"_session/steering",
+				{ sessionId, prompt, _meta: { steering: { idleBehavior: "promptRequired" } } },
+				this.options.handshakeTimeoutMs,
+			),
+			signal,
+		);
+		return parseSteerOutcome(result);
 	}
 
 	/** Slash commands the current session advertised (`available_commands_update`). */
@@ -312,6 +351,7 @@ export class AcpClient {
 			const finished = response.then((result): PromptResult => ({
 				kind: "finished",
 				stopReason: parseStopReason(result),
+				usage: parsePromptUsage(result),
 			}));
 			if (!signal) return await finished;
 			return await new Promise<PromptResult>((resolve, reject) => {
@@ -337,10 +377,10 @@ export class AcpClient {
 	}
 
 	/** `session/new`, authenticating once with the configured method if the agent asks. */
-	private async newSession(conn: Connection, authenticate: boolean): Promise<string> {
+	private async newSession(conn: Connection, authenticate: boolean, extra: Record<string, unknown>): Promise<string> {
 		const create = async () => {
 			const { sessionId, config } = parseNewSessionResult(
-				await this.request("session/new", { cwd: this.cwd, mcpServers: [] }, this.options.handshakeTimeoutMs),
+				await this.request("session/new", { cwd: this.cwd, mcpServers: [], ...extra }, this.options.handshakeTimeoutMs),
 			);
 			conn.sessions.set(sessionId, { config, initialModel: config.model?.currentValue });
 			return sessionId;
@@ -395,7 +435,15 @@ export class AcpClient {
 			// Own process group, so the whole tree can be killed at once.
 			detached: !IS_WINDOWS,
 		});
-		const conn: Connection = { proc, state: "starting", session: null, sessionUsed: false, sessions: new Map(), commands: new Map() };
+		const conn: Connection = {
+			proc,
+			state: "starting",
+			session: null,
+			sessionKey: "",
+			sessionUsed: false,
+			sessions: new Map(),
+			commands: new Map(),
+		};
 		this.conn = conn;
 		track(proc);
 

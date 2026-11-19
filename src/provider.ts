@@ -1,6 +1,6 @@
 /**
- * The `acp` provider: a Pi `Provider` whose models delegate the whole agent
- * loop to configured ACP agents.
+ * The `acp` provider: a Pi `Provider` whose models delegate the agent loop
+ * to configured ACP agents.
  *
  * Each agent is the model `acp/<agent id>`, which runs with the agent's own
  * default model. Models the agent offers are discovered by opening a session
@@ -8,17 +8,37 @@
  * switches the session to it before the prompt is sent. Pi's thinking level
  * maps onto the agent's `thought_level` setting when it has one.
  *
- * ACP agents execute their own tools and keep conversation history
- * server-side, so each Pi model turn sends only the newest user message and
- * streams back thought chunks, tool notices, and the reply text. ACP reports
- * no per-turn token usage, so usage is zero.
+ * Pi's side of the session:
+ * - Tools: Pi's current tools are served to the agent over MCP (see
+ *   `mcp-server.ts`). A call becomes a real Pi tool call: the provider ends
+ *   the Pi message there, Pi runs the tool with its own approvals, hooks and
+ *   display, and the result goes back to the agent's waiting MCP request.
+ *   The agent's own tool calls are shown as `acp_tool` rows (or inline text).
+ *   One ACP turn therefore spans several Pi messages.
+ * - System prompt: sent once per ACP session, on `session/new` when the agent
+ *   supports it, else in front of the first prompt; a later change is sent
+ *   with the next prompt.
+ * - History: the agent keeps its own conversation, so each prompt carries only
+ *   what it has not seen. A session that missed part of Pi's history (a
+ *   resumed or forked Pi session, a model switch, a rewritten branch) gets a
+ *   transcript of that part first.
+ * - Queue: every queued user message is sent. A steering message that arrives
+ *   while the agent works goes into the running turn with `_session/steering`
+ *   when the agent supports it, else with the next Pi tool result it is
+ *   waiting on, else as the next prompt once the running one ends.
+ * - Isolated requests (compaction and branch summaries, `cacheRetention:
+ *   "none"`) run in a separate, throwaway agent process.
  */
 
+import { randomUUID } from "node:crypto";
 import {
 	createAssistantMessageEventStream,
+	getCurrentSystemPrompt,
+	getCurrentTools,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
+	type Message,
 	type Model,
 	type ModelThinkingLevel,
 	type Provider,
@@ -27,15 +47,18 @@ import {
 	type StreamOptions,
 	type ThinkingLevelMap,
 	type ToolCall,
+	type ToolResultMessage,
 	type TranscriptContext,
 	type Usage,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
-import { AcpClient, AcpRpcError, type PromptResult, type ServerRequest } from "./acp-client.ts";
+import { AcpClient, AcpRpcError, type PromptResult, type ServerRequest, type SessionSetup } from "./acp-client.ts";
 import {
 	ACP_AUTH_REQUIRED,
 	RPC_INVALID_PARAMS,
 	RPC_METHOD_NOT_FOUND,
 	autoApprove,
+	isRecord,
 	parsePermissionRequest,
 	type AcpAgentInfo,
 	type AcpCommand,
@@ -45,9 +68,19 @@ import {
 	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type AcpStopReason,
+	type AcpUsage,
 } from "./acp.ts";
-import type { AcpAgentConfig, AcpProviderConfig } from "./config.ts";
+import { PI_MCP_SERVER, deepMerge, type AcpAgentConfig, type AcpProviderConfig } from "./config.ts";
+import { PiMcpServer, toMcpTool, type McpCall, type McpCallResult, type McpContent, type McpTool } from "./mcp-server.ts";
 import { ACP_TOOL_NAME, compactInput, type AcpToolArgs, type AcpToolState, type AwaitTool } from "./native-tools.ts";
+import {
+	conversation,
+	messageKey,
+	renderTranscript,
+	tagged,
+	userBlocks,
+	type AcpContentBlock,
+} from "./transcript.ts";
 
 export const ACP_PROVIDER_ID = "acp";
 const ACP_API = "acp";
@@ -55,6 +88,13 @@ const ACP_API = "acp";
 const PI_THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /** Agent values that also mean "off". */
 const OFF_ALIASES = ["off", "none", "disabled"];
+
+/**
+ * Tool names and titles agents give calls to Pi's MCP server, as observed:
+ * Claude `mcp__pi__read`, Codex `mcp.pi.read`, Vibe `mcp_pi.read`,
+ * Antigravity `mcp_pi_read` (titled "Run mcp_pi_read"), and `pi/read`.
+ */
+const PI_TOOL_REF = new RegExp(`(?:^|[\\s:(\\[])(?:mcp(?:__|[._])${PI_MCP_SERVER}(?:__|[._/])|${PI_MCP_SERVER}/)([\\w-]+)`);
 
 /**
  * Maps Pi thinking levels onto the agent's `thought_level` values by name
@@ -77,7 +117,7 @@ function toModel(agentId: string, id: string, name: string, thinking: ThinkingLe
 		baseUrl: `stdio://${agentId}`, // Unused: the transport is a child process.
 		reasoning: thinking !== undefined,
 		...(thinking ? { thinkingLevelMap: thinking } : {}),
-		input: ["text"],
+		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
@@ -114,6 +154,15 @@ const zeroUsage = (): Usage => ({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 });
 
+function addUsage(total: Usage, usage: AcpUsage | undefined): void {
+	if (!usage) return;
+	total.input += usage.input;
+	total.output += usage.output;
+	total.cacheRead += usage.cacheRead;
+	total.cacheWrite += usage.cacheWrite;
+	total.totalTokens = total.input + total.output + total.cacheRead + total.cacheWrite;
+}
+
 /** Decides a `session/request_permission`; `signal` aborts when the turn is cancelled. */
 export type PermissionPolicy = (
 	request: AcpPermissionRequest,
@@ -148,22 +197,16 @@ export interface AcpProviderHandle {
 
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-/** Text of the newest user message; images are noted since prompts here are text-only. */
-function latestUserPrompt(messages: TranscriptContext["messages"]): string | null {
-	const message = messages.findLast((candidate) => candidate.role === "user");
-	if (!message) return null;
-	if (typeof message.content === "string") return message.content.trim() ? message.content : null;
-	const texts = message.content.flatMap((block) => (block.type === "text" ? [block.text] : []));
-	const images = message.content.length - texts.length;
-	if (images > 0) texts.push(`[${images} image attachment(s) could not be forwarded to the ACP agent]`);
-	const text = texts.join("\n");
-	return text.trim() ? text : null;
-}
-
 /** First line of tool output, capped so huge outputs don't flood the transcript. */
 function summarize(text: string, max = 200): string {
 	const line = text.trim().split("\n", 1)[0] ?? "";
 	return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
+/** Index after the last assistant message: where the messages Pi added since start. */
+function tailStart(messages: readonly Message[]): number {
+	for (let index = messages.length - 1; index >= 0; index--) if (messages[index]?.role === "assistant") return index + 1;
+	return 0;
 }
 
 /**
@@ -205,10 +248,9 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 		push();
 		stream.end(message);
 	};
-	/** Ends the message at a tool call Pi shows as a tool row; the ACP turn goes on in the next message. */
+	/** Ends the message at a tool call Pi runs or shows as a tool row; the ACP turn goes on in the next message. */
 	const toolUse = (toolCall: ToolCall): void =>
 		settle(() => {
-			close();
 			const contentIndex = message.content.length;
 			message.content.push(toolCall);
 			stream.push({ type: "toolcall_start", contentIndex, partial: message });
@@ -216,8 +258,9 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 			message.stopReason = "toolUse";
 			stream.push({ type: "done", reason: "toolUse", message });
 		});
-	const done = (reason: "stop" | "length"): void =>
+	const done = (reason: "stop" | "length", usage?: Usage): void =>
 		settle(() => {
+			if (usage) message.usage = usage;
 			message.stopReason = reason;
 			stream.push({ type: "done", reason, message });
 		});
@@ -235,6 +278,10 @@ type MessageWriter = ReturnType<typeof createMessageWriter>;
 
 type TurnOutcome = { result: PromptResult } | { error: unknown; auth: AcpAgentInfo | null };
 
+/** A Pi tool call the agent made over MCP, waiting for Pi's result. */
+type PiToolEvent = { type: "pi_tool_call"; id: string; name: string; arguments: Record<string, unknown> };
+type TurnEvent = AcpSessionUpdate | PiToolEvent;
+
 interface ToolWaiter {
 	resolve: (state: AcpToolState) => void;
 	onPartial: (state: AcpToolState) => void;
@@ -244,20 +291,55 @@ interface ToolEntry {
 	title: string | undefined;
 	/** The mirror tool's arguments, fixed by the first update so the tool row does not change. */
 	args: AcpToolArgs | undefined;
+	rawInput: unknown;
 	/** Whether a Pi message already shows this call as a tool row. */
 	mirrored: boolean;
+	/** A call to Pi's MCP server: Pi shows and runs it as its own tool call, so it is not mirrored. */
+	piOwned: boolean;
 	state: AcpToolState;
 	waiters: Set<ToolWaiter>;
 }
 
+interface PiCall {
+	name: string;
+	resolve: (result: McpCallResult) => void;
+}
+
 interface LiveTurn {
 	agent: AcpAgentConfig;
+	acp: AcpClient;
+	sessionId: string;
 	controller: AbortController;
-	/** Updates that arrived while no Pi message was attached (Pi was running the mirror tools). */
-	buffer: AcpSessionUpdate[];
-	attached: { consume: (update: AcpSessionUpdate) => void; finish: (outcome: TurnOutcome) => void } | null;
+	native: boolean;
+	steering: boolean;
+	/** Events that arrived while no Pi message was attached (Pi was running tools). */
+	buffer: TurnEvent[];
+	attached: { consume: (event: TurnEvent) => void; finish: (outcome: TurnOutcome) => void } | null;
 	outcome: TurnOutcome | null;
+	/** Whether a `session/prompt` of this turn is in flight. */
+	running: boolean;
+	/** Prompts to send, in order, once the running one ends (steering the agent could not take mid-turn). */
+	queued: AcpContentBlock[][];
 	tools: Map<string, ToolEntry>;
+	piCalls: Map<string, PiCall>;
+	usage: Usage;
+	onRawUpdate: ((params: unknown) => void) | undefined;
+}
+
+/** What the provider knows one ACP session has seen of the Pi conversation. */
+interface SyncState {
+	/** Timestamps of the assistant messages this session streamed. */
+	ownStamps: Set<number>;
+	/** The newest of those seen in Pi's history: what the session has seen goes up to here. */
+	anchor: number | undefined;
+	/** Key of the first history message; compaction replaces it. */
+	first: string | undefined;
+	/** Tool call ids this session produced (mirrored and Pi calls): their results are not news to it. */
+	ours: Set<string>;
+	/** Keys of user messages already delivered (prompted, steered, or attached to a tool result). */
+	delivered: Set<string>;
+	/** The Pi system prompt the session last received. */
+	systemPrompt: string;
 }
 
 /** Renders tool activity as short inline notices in the reply text. */
@@ -287,14 +369,14 @@ function authHint(agent: AcpAgentConfig, info: AcpAgentInfo | null): string {
 }
 
 /** Ends the message according to the agent's `stopReason`. */
-function finishTurn(writer: MessageWriter, agent: AcpAgentConfig, stopReason: AcpStopReason): void {
+function finishTurn(writer: MessageWriter, agent: AcpAgentConfig, stopReason: AcpStopReason, usage?: Usage): void {
 	switch (stopReason) {
 		case "end_turn":
-			writer.done("stop");
+			writer.done("stop", usage);
 			return;
 		case "max_tokens":
 		case "max_turn_requests":
-			writer.done("length");
+			writer.done("length", usage);
 			return;
 		case "refusal":
 			writer.fail("error", `${agent.name} refused to continue this turn.`);
@@ -309,6 +391,32 @@ function finishTurn(writer: MessageWriter, agent: AcpAgentConfig, stopReason: Ac
 	}
 }
 
+/** Pi tool result content for the agent's MCP request. */
+function toMcpResult(message: ToolResultMessage): McpCallResult {
+	const content: McpContent[] = message.content.map((block) =>
+		block.type === "text" ? { type: "text", text: block.text } : { type: "image", data: block.data, mimeType: block.mimeType },
+	);
+	if (content.length === 0) content.push({ type: "text", text: message.isError ? "The tool failed." : "Done." });
+	return message.isError ? { content, isError: true } : { content };
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+	try {
+		return JSON.stringify(left) === JSON.stringify(right);
+	} catch {
+		return false;
+	}
+}
+
+/** The Pi tool an agent tool call refers to, from its tool name or title, if it is one of Pi's. */
+export function piToolRef(toolName: string | undefined, title: string | undefined): string | undefined {
+	for (const text of [toolName, title]) {
+		const match = text ? PI_TOOL_REF.exec(text) : null;
+		if (match?.[1]) return match[1];
+	}
+	return undefined;
+}
+
 export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandle {
 	const { log } = options;
 	const policy: PermissionPolicy = options.permissionPolicy ?? (async (request) => autoApprove(request));
@@ -321,6 +429,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	let cwd = process.cwd();
 	/** One client (and agent process) per agent, spawned on first use. */
 	const clients = new Map<string, AcpClient>();
+	/** What each ACP session has seen, by session id. */
+	const sync = new Map<string, SyncState>();
+	/** The tools served to each agent, from the latest Pi context. */
+	const served = new Map<string, McpTool[]>();
+	let mcp: PiMcpServer | null = null;
+	/** The ACP turn in progress; it spans several Pi messages. */
+	let live: LiveTurn | null = null;
 
 	const answerServerRequest = async (
 		agent: AcpAgentConfig,
@@ -333,24 +448,98 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!request) throw new AcpRpcError("Malformed session/request_permission params", RPC_INVALID_PARAMS);
 		// A cancelled turn must answer every pending permission request with `cancelled`.
 		if (signal?.aborted) return { outcome: { outcome: "cancelled" } };
+		// Pi's own tools pass Pi's approval when Pi runs them, so the agent's check is redundant.
+		if (isPiToolPermission(params)) return { outcome: autoApprove(request) };
 		const outcome = await policy(request, { agent, signal });
 		return { outcome: signal?.aborted ? { outcome: "cancelled" } : outcome };
 	};
 
+	function isPiToolPermission(params: unknown): boolean {
+		const toolCall = isRecord(params) && isRecord(params.toolCall) ? params.toolCall : undefined;
+		if (!toolCall) return false;
+		const id = typeof toolCall.toolCallId === "string" ? toolCall.toolCallId : undefined;
+		if (id && live?.tools.get(id)?.piOwned) return true;
+		const meta = isRecord(toolCall._meta) && isRecord(toolCall._meta.claudeCode) ? toolCall._meta.claudeCode : undefined;
+		const toolName = typeof toolCall.name === "string" ? toolCall.name : typeof meta?.toolName === "string" ? meta.toolName : undefined;
+		return piToolRef(toolName, typeof toolCall.title === "string" ? toolCall.title : undefined) !== undefined;
+	}
+
+	const newClient = (agent: AcpAgentConfig, clientCwd: string): AcpClient =>
+		new AcpClient({
+			agent,
+			cwd: clientCwd,
+			handshakeTimeoutMs: options.config.handshakeTimeoutMs,
+			onServerRequest: (request) => answerServerRequest(agent, request),
+			log: log && ((message) => log(`${agent.id}: ${message}`)),
+		});
+
 	const getClient = (agent: AcpAgentConfig): AcpClient => {
 		let client = clients.get(agent.id);
 		if (!client) {
-			client = new AcpClient({
-				agent,
-				cwd,
-				handshakeTimeoutMs: options.config.handshakeTimeoutMs,
-				onServerRequest: (request) => answerServerRequest(agent, request),
-				log: log && ((message) => log(`${agent.id}: ${message}`)),
-			});
+			client = newClient(agent, cwd);
 			clients.set(agent.id, client);
 		}
 		return client;
 	};
+
+	/** Starts Pi's MCP server once; null (Pi's tools are not offered) when it cannot start. */
+	async function mcpServer(): Promise<PiMcpServer | null> {
+		mcp ??= new PiMcpServer({ tools: (agentId) => served.get(agentId) ?? [], call: handleMcpCall, log });
+		try {
+			await mcp.start();
+			return mcp;
+		} catch (error) {
+			log?.(`Pi's MCP server failed to start: ${errorMessage(error)}`);
+			return null;
+		}
+	}
+
+	/** Pi's current tools as served to `agent`; tells connected agents when the list changed. */
+	function updateServedTools(agent: AcpAgentConfig, context: TranscriptContext): void {
+		if (agent.piTools === "off") return;
+		const tools = getCurrentTools(context.messages).flatMap((tool) => {
+			if (tool.name === ACP_TOOL_NAME) return [];
+			const mcpTool = toMcpTool(tool);
+			if (!mcpTool) log?.(`${agent.id}: tool '${tool.name}' has no object schema and is not offered over MCP`);
+			return mcpTool ? [mcpTool] : [];
+		});
+		const previous = served.get(agent.id);
+		served.set(agent.id, tools);
+		if (previous && !sameJson(previous, tools)) mcp?.notifyToolsChanged(agent.id);
+	}
+
+	/** `session/new` params for Pi's tools and system prompt, chosen from what the agent advertises. */
+	function sessionSetup(agent: AcpAgentConfig, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
+		return {
+			key: "pi",
+			params: (info) => {
+				const params: Record<string, unknown> = {};
+				const piOnly = agent.piTools === "pi" && agent.ownToolsOffMeta !== undefined;
+				if (server && agent.piTools !== "off") {
+					const transport = agent.mcpTransport === "http" && info.capabilities.mcpHttp ? "http" : "stdio";
+					params.mcpServers = [server.serverFor(agent.id, transport)];
+				}
+				if (agent.systemPrompt === "session" && info.capabilities.systemPrompt && systemPrompt) {
+					params.systemPrompt = { mode: "append", content: [{ type: "text", text: systemPrompt }] };
+					onPrompt();
+				}
+				const meta =
+					piOnly && params.mcpServers
+						? deepMerge(agent.sessionMeta ?? {}, agent.ownToolsOffMeta ?? {})
+						: agent.sessionMeta;
+				if (meta && Object.keys(meta).length > 0) params._meta = meta;
+				return params;
+			},
+		};
+	}
+
+	/** Whether the session produced `message`, or already received it. */
+	function isOwn(state: SyncState, message: Message): boolean {
+		if (message.role === "assistant") return message.provider === ACP_PROVIDER_ID && state.ownStamps.has(message.timestamp);
+		if (message.role === "toolResult") return state.ours.has(message.toolCallId);
+		if (message.role === "user") return state.delivered.has(messageKey(message));
+		return false;
+	}
 
 	async function runTurn(
 		stream: AssistantMessageEventStream,
@@ -376,20 +565,37 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 		const { agent } = target;
-		const lastMessage = context.messages.at(-1);
-		if (
-			live?.agent.id === agent.id &&
-			lastMessage?.role === "toolResult" &&
-			live.tools.get(lastMessage.toolCallId)?.mirrored
-		) {
+		const extra = streamOptions as (StreamOptions & { disableContinuation?: boolean }) | undefined;
+		// A cache-warming request: ACP agents keep their own cache, so there is nothing to warm.
+		if (extra?.disableContinuation === true && extra.maxTokens === 1) {
 			stream.push({ type: "start", partial: message });
+			writer.done("stop");
+			return;
+		}
+		if (streamOptions?.cacheRetention === "none") {
+			await runIsolated(stream, writer, message, agent, target.modelId, model, context, streamOptions);
+			return;
+		}
+		updateServedTools(agent, context);
+
+		const messages = conversation(context.messages);
+		const tail = messages.slice(tailStart(messages));
+		if (live && live.agent.id === agent.id && !live.controller.signal.aborted && continuesLiveTurn(live, tail)) {
+			sync.get(live.sessionId)?.ownStamps.add(message.timestamp);
+			stream.push({ type: "start", partial: message });
+			await continueTurn(live, tail);
 			attach(live, writer, signal);
 			return;
 		}
-		const promptText = latestUserPrompt(context.messages);
-		if (promptText === null) {
+
+		const users = tail.filter((candidate): candidate is UserMessage => candidate.role === "user");
+		if (users.length === 0) {
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
 			return;
+		}
+		if (live) {
+			live.controller.abort();
+			live = null;
 		}
 		const acp = getClient(agent);
 		const abortedOrError = (error: unknown): void => {
@@ -398,15 +604,76 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			else writer.fail("error", errorMessage(error));
 		};
 
+		const systemPrompt = getCurrentSystemPrompt(context.messages);
 		// Setup failures (spawn, handshake, session) end the stream before `start`.
 		let sessionId: string;
+		let state: SyncState;
+		let info: AcpAgentInfo;
 		try {
-			sessionId = await acp.ensureSession({ signal });
+			const server = agent.piTools === "off" ? null : await mcpServer();
+			let promptInSession = false;
+			const setup = sessionSetup(agent, server, systemPrompt, () => (promptInSession = true));
+			sessionId = await acp.ensureSession({ signal, setup });
+			let known = sync.get(sessionId);
+			if (known && diverged(known, messages)) {
+				// The Pi branch changed under the session: start over from Pi's history.
+				log?.(`${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`);
+				sync.delete(sessionId);
+				acp.resetSession(cwd);
+				promptInSession = false;
+				sessionId = await acp.ensureSession({ signal, setup });
+				known = undefined;
+			}
+			state = known ?? {
+				ownStamps: new Set(),
+				anchor: undefined,
+				first: undefined,
+				ours: new Set(),
+				delivered: new Set(),
+				systemPrompt: promptInSession ? systemPrompt : "",
+			};
+			sync.set(sessionId, state);
+			info = acp.info ?? (await acp.ensureReady(signal));
 			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions);
 		} catch (error) {
 			abortedOrError(error);
 			return;
 		}
+
+		const blocks: AcpContentBlock[] = [];
+		if (agent.systemPrompt !== "off" && systemPrompt && state.systemPrompt !== systemPrompt) {
+			blocks.push(
+				tagged(
+					"system-instructions",
+					systemPrompt,
+					state.systemPrompt
+						? "Pi, the host application you run in, updated its instructions. They replace the earlier ones:"
+						: "Instructions from Pi, the host application you run in. Follow them together with your own:",
+				),
+			);
+			state.systemPrompt = systemPrompt;
+		}
+		const history = messages.slice(0, messages.length - tail.length);
+		const anchorIndex = state.anchor === undefined ? -1 : history.findLastIndex((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
+		const unseen = history.slice(anchorIndex + 1).filter((candidate) => !isOwn(state, candidate));
+		if (unseen.length > 0) {
+			blocks.push(
+				tagged(
+					"conversation-history",
+					renderTranscript(unseen),
+					"Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:",
+				),
+			);
+		}
+		const pendingUsers = users.filter((user) => !state.delivered.has(messageKey(user)));
+		for (const user of pendingUsers.length > 0 ? pendingUsers : users.slice(-1)) {
+			blocks.push(...userBlocks(user, info.capabilities.image));
+			state.delivered.add(messageKey(user));
+		}
+		const newestOwn = history.findLast((candidate) => candidate.role === "assistant" && isOwn(state, candidate));
+		if (newestOwn) state.anchor = newestOwn.timestamp;
+		state.first = messages[0] ? messageKey(messages[0]) : undefined;
+		state.ownStamps.add(message.timestamp);
 
 		stream.push({ type: "start", partial: message });
 		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
@@ -419,92 +686,201 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			});
 		let payload: unknown;
 		try {
-			const defaultPayload = { sessionId, prompt: [{ type: "text", text: promptText }] };
+			const defaultPayload = { sessionId, prompt: blocks };
 			payload = (await streamOptions?.onPayload?.(defaultPayload, model)) ?? defaultPayload;
 		} catch (error) {
 			abortedOrError(error);
 			return;
 		}
 
-		if (options.nativeTools?.()) {
-			if (live) live.controller.abort();
-			const turn: LiveTurn = {
-				agent,
-				controller: new AbortController(),
-				buffer: [],
-				attached: null,
-				outcome: null,
-				tools: new Map(),
-			};
-			live = turn;
-			acp
-				.prompt({
-					sessionId,
-					payload,
-					signal: turn.controller.signal,
-					onRawUpdate,
-					onUpdate: (update) => dispatch(turn, update),
-				})
-				.then(
-					(result) => settleTurn(turn, { result }),
-					(error: unknown) => settleTurn(turn, { error, auth: acp.info }),
-				);
-			attach(turn, writer, signal);
-			return;
-		}
-
-		const renderTool = createToolRenderer((text) => writer.append("text", text));
-		try {
-			const result = await acp.prompt({
-				sessionId,
-				payload,
-				signal,
-				onRawUpdate,
-				onUpdate: (update) => {
-					if (update.type === "agent_message_chunk") writer.append("text", update.text);
-					else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
-					else renderTool(update);
-				},
-			});
-			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
-			else finishTurn(writer, agent, result.stopReason);
-		} catch (error) {
-			abortedOrError(error);
-		}
+		const turn: LiveTurn = {
+			agent,
+			acp,
+			sessionId,
+			controller: new AbortController(),
+			native: options.nativeTools?.() === true,
+			steering: info.capabilities.steering,
+			buffer: [],
+			attached: null,
+			outcome: null,
+			running: false,
+			queued: [],
+			tools: new Map(),
+			piCalls: new Map(),
+			usage: zeroUsage(),
+			onRawUpdate,
+		};
+		live = turn;
+		startPrompt(turn, payload);
+		attach(turn, writer, signal);
 	}
 
-	/** The ACP turn being shown with native tool rows; it spans several Pi messages. */
-	let live: LiveTurn | null = null;
+	/**
+	 * Whether Pi's history no longer holds what the session saw: its newest reply
+	 * seen there is gone (a tree jump or fork to an earlier point) or the first
+	 * message changed (compaction). Messages an extension adds for one request
+	 * only do not count, since they are never the session's replies.
+	 */
+	function diverged(state: SyncState, messages: readonly Message[]): boolean {
+		if (state.first !== undefined && messages[0] && messageKey(messages[0]) !== state.first) return true;
+		if (state.anchor === undefined) return false;
+		return !messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
+	}
+
+	/** Whether the messages Pi added answer tool calls of `turn`, so the same ACP turn goes on. */
+	function continuesLiveTurn(turn: LiveTurn, tail: readonly Message[]): boolean {
+		return tail.some(
+			(candidate) =>
+				candidate.role === "toolResult" &&
+				(turn.piCalls.has(candidate.toolCallId) || turn.tools.get(candidate.toolCallId)?.mirrored === true),
+		);
+	}
+
+	/**
+	 * Hands Pi's tool results to the agent's waiting MCP requests and delivers
+	 * the steering messages Pi queued after them.
+	 */
+	async function continueTurn(turn: LiveTurn, tail: readonly Message[]): Promise<void> {
+		const state = sync.get(turn.sessionId);
+		const results = tail.filter(
+			(candidate): candidate is ToolResultMessage => candidate.role === "toolResult" && turn.piCalls.has(candidate.toolCallId),
+		);
+		const steers = tail.filter(
+			(candidate): candidate is UserMessage => candidate.role === "user" && !state?.delivered.has(messageKey(candidate)),
+		);
+		const image = turn.acp.info?.capabilities.image === true;
+		const steerBlocks = steers.flatMap((steer) => userBlocks(steer, image));
+		for (const steer of steers) state?.delivered.add(messageKey(steer));
+
+		let steerDelivered = steerBlocks.length === 0;
+		// The steer goes first, so the agent has it queued before it reads the tool results.
+		if (!steerDelivered && turn.steering && turn.running) {
+			try {
+				steerDelivered = (await turn.acp.steer(turn.sessionId, steerBlocks)) === "steered";
+			} catch (error) {
+				log?.(`${turn.agent.id}: _session/steering failed, falling back: ${errorMessage(error)}`);
+			}
+		}
+		for (const [index, result] of results.entries()) {
+			const call = turn.piCalls.get(result.toolCallId);
+			if (!call) continue;
+			turn.piCalls.delete(result.toolCallId);
+			const reply = toMcpResult(result);
+			if (!steerDelivered && index === results.length - 1) {
+				reply.content.push({
+					type: "text",
+					text: `<user-message>\nThe user sent this while the tool ran. Take it into account now:\n${steerBlocks
+						.map((block) => (block.type === "text" ? block.text : "[image]"))
+						.join("\n")}\n</user-message>`,
+				});
+				steerDelivered = true;
+			}
+			call.resolve(reply);
+		}
+		if (!steerDelivered) enqueuePrompt(turn, steerBlocks);
+	}
+
+	/** Sends `blocks` as the turn's next prompt: now if the agent finished, else once the running prompt ends. */
+	function enqueuePrompt(turn: LiveTurn, blocks: AcpContentBlock[]): void {
+		const finishedCleanly =
+			turn.outcome !== null && "result" in turn.outcome && turn.outcome.result.kind === "finished" && turn.outcome.result.stopReason === "end_turn";
+		if (!turn.running && finishedCleanly) {
+			turn.outcome = null;
+			startPrompt(turn, { sessionId: turn.sessionId, prompt: blocks });
+		} else if (turn.running) turn.queued.push(blocks);
+	}
+
+	function startPrompt(turn: LiveTurn, payload: unknown): void {
+		turn.running = true;
+		turn.acp
+			.prompt({
+				sessionId: turn.sessionId,
+				payload,
+				signal: turn.controller.signal,
+				onRawUpdate: turn.onRawUpdate,
+				onUpdate: (update) => dispatch(turn, update),
+			})
+			.then(
+				(result) => settleTurn(turn, { result }),
+				(error: unknown) => settleTurn(turn, { error, auth: turn.acp.info }),
+			);
+	}
 
 	/** Records an update, then hands it to the attached message or buffers it for the next one. */
-	function dispatch(turn: LiveTurn, update: AcpSessionUpdate): void {
-		if (update.type === "tool_call" || update.type === "tool_call_update") {
-			let entry = turn.tools.get(update.toolCallId);
+	function dispatch(turn: LiveTurn, event: TurnEvent): void {
+		if (event.type === "tool_call" || event.type === "tool_call_update") {
+			let entry = turn.tools.get(event.toolCallId);
 			if (!entry) {
 				entry = {
 					title: undefined,
 					args: undefined,
+					rawInput: undefined,
 					mirrored: false,
+					piOwned: false,
 					state: { status: undefined, content: { text: [], diffs: [], terminals: [] }, rawOutput: undefined },
 					waiters: new Set(),
 				};
-				turn.tools.set(update.toolCallId, entry);
+				turn.tools.set(event.toolCallId, entry);
 			}
-			if (update.title) entry.title = update.title;
-			if (update.status) entry.state.status = update.status;
-			if (update.content) entry.state.content = update.content;
-			if (update.rawOutput !== undefined) entry.state.rawOutput = update.rawOutput;
+			if (event.title) entry.title = event.title;
+			if (event.status) entry.state.status = event.status;
+			if (event.content) entry.state.content = event.content;
+			if (event.rawOutput !== undefined) entry.state.rawOutput = event.rawOutput;
+			if (event.rawInput !== undefined) entry.rawInput = event.rawInput;
+			if (!entry.mirrored && piToolRef(event.toolName, entry.title)) entry.piOwned = true;
 			entry.args ??= {
 				agent: turn.agent.id,
 				title: entry.title ?? "tool",
-				...(update.kind ? { kind: update.kind } : {}),
-				...(update.locations?.length ? { locations: update.locations } : {}),
-				...(compactInput(update.rawInput) !== undefined ? { input: compactInput(update.rawInput) } : {}),
+				...(event.kind ? { kind: event.kind } : {}),
+				...(event.locations?.length ? { locations: event.locations } : {}),
+				...(compactInput(event.rawInput) !== undefined ? { input: compactInput(event.rawInput) } : {}),
 			};
 			if (entry.mirrored) notifyWaiters(entry);
 		}
-		if (turn.attached) turn.attached.consume(update);
-		else turn.buffer.push(update);
+		if (turn.attached) turn.attached.consume(event);
+		else turn.buffer.push(event);
+	}
+
+	/** An MCP `tools/call` from the agent: becomes a Pi tool call in the running turn. */
+	function handleMcpCall(call: McpCall): Promise<McpCallResult> {
+		const turn = live;
+		if (!turn || turn.agent.id !== call.agentId || turn.outcome || turn.controller.signal.aborted) {
+			return Promise.reject(new Error("Pi is not running a turn for this agent, so its tools are unavailable."));
+		}
+		if (!(served.get(call.agentId) ?? []).some((tool) => tool.name === call.name)) {
+			return Promise.reject(new Error(`Pi has no tool named '${call.name}'.`));
+		}
+		// The agent's own report of this call is shown by Pi's tool row instead.
+		for (const entry of [...turn.tools.values()].reverse()) {
+			if (entry.piOwned || entry.state.status === "completed" || entry.state.status === "failed") continue;
+			if (piToolRef(undefined, entry.title) === call.name || sameJson(entry.rawInput, call.arguments)) {
+				entry.piOwned = true;
+				break;
+			}
+		}
+		// A mirrored row Pi is waiting on would block it from running this call, which the agent waits on.
+		for (const entry of turn.tools.values()) {
+			if (entry.waiters.size === 0) continue;
+			if (entry.piOwned) entry.state = { ...entry.state, status: "completed", content: { text: [`Handed to Pi as ${call.name}.`], diffs: [], terminals: [] } };
+			notifyWaiters(entry, true);
+		}
+		const id = `pi_${randomUUID()}`;
+		sync.get(turn.sessionId)?.ours.add(id);
+		return new Promise<McpCallResult>((resolve, reject) => {
+			const onAbort = (): void => {
+				turn.piCalls.delete(id);
+				reject(new Error("The tool call was cancelled."));
+			};
+			call.signal.addEventListener("abort", onAbort, { once: true });
+			turn.piCalls.set(id, {
+				name: call.name,
+				resolve: (result) => {
+					call.signal.removeEventListener("abort", onAbort);
+					resolve(result);
+				},
+			});
+			dispatch(turn, { type: "pi_tool_call", id, name: call.name, arguments: call.arguments });
+		});
 	}
 
 	function notifyWaiters(entry: ToolEntry, force = false): void {
@@ -517,24 +893,37 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
-	/** Streams the turn into one Pi message until the next new tool call or the end of the turn. */
+	/** Streams the turn into one Pi message until the next tool call or the end of the turn. */
 	function attach(turn: LiveTurn, writer: MessageWriter, signal: AbortSignal | undefined): void {
 		if (signal?.aborted) turn.controller.abort();
 		else signal?.addEventListener("abort", () => turn.controller.abort(), { once: true });
+		const renderTool = createToolRenderer((text) => writer.append("text", text));
 		let ended = false;
-		const consume = (update: AcpSessionUpdate): void => {
+		const endAt = (toolCall: ToolCall): void => {
+			ended = true;
+			turn.attached = null;
+			writer.toolUse(toolCall);
+		};
+		const consume = (event: TurnEvent): void => {
 			if (ended) return;
-			if (update.type === "agent_message_chunk") writer.append("text", update.text);
-			else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
-			else {
-				const entry = turn.tools.get(update.toolCallId);
-				if (!entry || entry.mirrored) return;
+			if (event.type === "agent_message_chunk") writer.append("text", event.text);
+			else if (event.type === "agent_thought_chunk") writer.append("thinking", event.text);
+			else if (event.type === "pi_tool_call") {
+				if (!turn.piCalls.has(event.id)) return;
+				endAt({ type: "toolCall", id: event.id, name: event.name, arguments: event.arguments as ToolCall["arguments"] });
+			} else {
+				const entry = turn.tools.get(event.toolCallId);
+				if (!entry || entry.piOwned) return;
+				if (!turn.native) {
+					renderTool(event);
+					return;
+				}
+				if (entry.mirrored) return;
 				entry.mirrored = true;
-				ended = true;
-				turn.attached = null;
-				writer.toolUse({
+				sync.get(turn.sessionId)?.ours.add(event.toolCallId);
+				endAt({
 					type: "toolCall",
-					id: update.toolCallId,
+					id: event.toolCallId,
 					name: ACP_TOOL_NAME,
 					arguments: (entry.args ?? { agent: turn.agent.id, title: entry.title ?? "tool" }) as unknown as ToolCall["arguments"],
 				});
@@ -551,7 +940,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					writer.fail("error", authHint(turn.agent, outcome.auth));
 				else writer.fail("error", errorMessage(outcome.error));
 			} else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
-			else finishTurn(writer, turn.agent, outcome.result.stopReason);
+			else finishTurn(writer, turn.agent, outcome.result.stopReason, turn.usage);
 		};
 		while (turn.buffer.length > 0 && !ended) consume(turn.buffer.shift()!);
 		if (ended) return;
@@ -563,10 +952,70 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	function settleTurn(turn: LiveTurn, outcome: TurnOutcome): void {
+		turn.running = false;
+		if ("result" in outcome && outcome.result.kind === "finished") addUsage(turn.usage, outcome.result.usage);
+		const next = turn.queued.shift();
+		const cleanEnd = "result" in outcome && outcome.result.kind === "finished" && outcome.result.stopReason === "end_turn";
+		if (next && cleanEnd && !turn.controller.signal.aborted) {
+			startPrompt(turn, { sessionId: turn.sessionId, prompt: next });
+			return;
+		}
 		turn.outcome = outcome;
 		// Mirrored calls the agent never finalized end with what it last reported.
 		for (const entry of turn.tools.values()) notifyWaiters(entry, true);
+		for (const [id, call] of turn.piCalls) {
+			turn.piCalls.delete(id);
+			call.resolve({ content: [{ type: "text", text: "The turn ended before Pi ran this tool." }], isError: true });
+		}
 		turn.attached?.finish(outcome);
+	}
+
+	/** Runs a request outside the conversation (a summary) in a throwaway agent process. */
+	async function runIsolated(
+		stream: AssistantMessageEventStream,
+		writer: MessageWriter,
+		message: AssistantMessage,
+		agent: AcpAgentConfig,
+		modelId: string | undefined,
+		model: Model<Api>,
+		context: TranscriptContext,
+		streamOptions: StreamOptions,
+	): Promise<void> {
+		const signal = streamOptions.signal;
+		const client = newClient(agent, cwd);
+		try {
+			const sessionId = await client.ensureSession({ signal });
+			await applySettings(client, agent, sessionId, modelId, model, streamOptions);
+			const info = client.info ?? (await client.ensureReady(signal));
+			const blocks: AcpContentBlock[] = [];
+			const systemPrompt = getCurrentSystemPrompt(context.messages);
+			if (systemPrompt) blocks.push(tagged("system-instructions", systemPrompt, "Instructions for this request:"));
+			const messages = conversation(context.messages);
+			const users = messages.filter((candidate): candidate is UserMessage => candidate.role === "user");
+			const others = messages.filter((candidate) => candidate.role !== "user");
+			if (others.length > 0) blocks.push(tagged("conversation-history", renderTranscript(messages), "The conversation:"));
+			else for (const user of users) blocks.push(...userBlocks(user, info.capabilities.image));
+			stream.push({ type: "start", partial: message });
+			const result = await client.prompt({
+				sessionId,
+				payload: { sessionId, prompt: blocks },
+				signal,
+				onUpdate: (update) => {
+					if (update.type === "agent_message_chunk") writer.append("text", update.text);
+				},
+			});
+			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
+			else {
+				const usage = zeroUsage();
+				addUsage(usage, result.usage);
+				finishTurn(writer, agent, result.stopReason, usage);
+			}
+		} catch (error) {
+			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
+			else writer.fail("error", errorMessage(error));
+		} finally {
+			client.dispose();
+		}
 	}
 
 	const awaitTool: AwaitTool = (toolCallId, signal, onPartial) => {
@@ -576,6 +1025,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return Promise.resolve({ status: "failed", content: { text: ["This ACP turn is no longer running."], diffs: [], terminals: [] }, rawOutput: undefined });
 		}
 		if (turn.outcome || entry.state.status === "completed" || entry.state.status === "failed") return Promise.resolve(entry.state);
+		// A Pi tool call already waits behind this row; end the row so Pi gets to it.
+		if (turn.buffer.some((event) => event.type === "pi_tool_call")) return Promise.resolve(entry.state);
 		return new Promise((resolve, reject) => {
 			const waiter: ToolWaiter = {
 				resolve: (state) => {
@@ -693,6 +1144,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		provider,
 		resetSession(nextCwd: string): void {
 			cwd = nextCwd;
+			live?.controller.abort();
+			live = null;
 			for (const client of clients.values()) client.resetSession(nextCwd);
 		},
 		agentFor: (modelId) => parseModelId(modelId, agents)?.agent.id,
@@ -703,6 +1156,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			live = null;
 			for (const client of clients.values()) client.dispose();
 			clients.clear();
+			sync.clear();
+			mcp?.dispose();
+			mcp = null;
 		},
 	};
 }

@@ -1,0 +1,325 @@
+/**
+ * MCP server that offers Pi's tools to ACP agents.
+ *
+ * One server per provider serves every agent; the agent id travels in the
+ * HTTP path or the stdio relay's handshake, so calls reach that agent's turn.
+ * Tool lists are read live, so a changed Pi loadout is visible on the next
+ * `tools/list`; stdio connections are also told with `list_changed`.
+ *
+ * Two transports, both bound to this machine and guarded by a random token:
+ * - HTTP (MCP Streamable HTTP, JSON responses only) on 127.0.0.1.
+ * - stdio: the agent spawns `mcp-relay.mjs`, which pipes its stdin/stdout to a
+ *   unix socket (a named pipe on Windows) in a private temp directory. Every
+ *   ACP agent must support stdio MCP servers, so this is the baseline.
+ *
+ * Only the MCP subset Pi needs is implemented: initialize, ping, tools/list,
+ * tools/call and request cancellation.
+ */
+
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
+import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { isRecord } from "./acp.ts";
+import { PI_MCP_SERVER, type McpTransport } from "./config.ts";
+
+const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const RELAY_PATH = fileURLToPath(new URL("./mcp-relay.mjs", import.meta.url));
+const IS_WINDOWS = process.platform === "win32";
+
+export interface McpTool {
+	name: string;
+	description: string;
+	inputSchema: Record<string, unknown>;
+}
+
+export type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+export interface McpCallResult {
+	content: McpContent[];
+	isError?: boolean;
+}
+
+export interface McpCall {
+	agentId: string;
+	name: string;
+	arguments: Record<string, unknown>;
+	/** Aborts when the agent cancels the request or disconnects. */
+	signal: AbortSignal;
+}
+
+export interface PiMcpServerOptions {
+	tools: (agentId: string) => McpTool[];
+	call: (call: McpCall) => Promise<McpCallResult>;
+	log?: ((message: string) => void) | undefined;
+}
+
+/** An ACP `McpServer` entry for `session/new`. */
+export type AcpMcpServer =
+	| { name: string; command: string; args: string[]; env: { name: string; value: string }[] }
+	| { type: "http"; name: string; url: string; headers: { name: string; value: string }[] };
+
+type JsonRpcId = string | number;
+
+const ROOT_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
+
+/**
+ * Some agents (Claude Code) drop a tool whose schema has a top-level
+ * combinator. Flatten it into one object, keeping the root properties first,
+ * and state the lost constraint in the description; Pi still validates the
+ * arguments against the full schema.
+ */
+export function flattenRootCombinators(schema: Record<string, unknown>): { schema: Record<string, unknown>; note?: string } {
+	const present = ROOT_COMBINATORS.filter((key) => Array.isArray(schema[key]));
+	if (present.length === 0) return { schema };
+	const { anyOf: _anyOf, oneOf: _oneOf, allOf: _allOf, ...rest } = schema;
+	const properties: Record<string, unknown> = isRecord(schema.properties) ? { ...schema.properties } : {};
+	const required = new Set(Array.isArray(schema.required) ? schema.required.filter((key) => typeof key === "string") : []);
+	const groups: string[] = [];
+	for (const key of present) {
+		for (const branch of schema[key] as unknown[]) {
+			if (!isRecord(branch)) continue;
+			const branchProps = isRecord(branch.properties) ? branch.properties : {};
+			for (const [name, value] of Object.entries(branchProps)) if (!(name in properties)) properties[name] = value;
+			const branchRequired = Array.isArray(branch.required) ? branch.required.filter((name) => typeof name === "string") : [];
+			if (key === "allOf") for (const name of branchRequired) required.add(name);
+			else groups.push((branchRequired.length > 0 ? branchRequired : Object.keys(branchProps)).join(", "));
+		}
+	}
+	const flat: Record<string, unknown> = { ...rest, type: "object", properties };
+	if (required.size > 0) flat.required = [...required];
+	else delete flat.required;
+	const exclusive = present.includes("oneOf");
+	const note =
+		groups.length > 0
+			? `Input constraint: provide parameters for ${exclusive ? "exactly one" : "at least one"} of: ${groups.map((group) => `(${group})`).join(" or ")}.`
+			: present.includes("allOf")
+				? "Input constraint: all listed parameters apply together."
+				: undefined;
+	return note ? { schema: flat, note } : { schema: flat };
+}
+
+/** A Pi tool as an MCP tool; null when its parameters are not an object schema, which MCP requires. */
+export function toMcpTool(tool: { name: string; description: string; parameters: unknown }): McpTool | null {
+	// The JSON round trip drops TypeBox's symbol-keyed metadata.
+	const parameters: unknown = JSON.parse(JSON.stringify(tool.parameters ?? {}));
+	if (!isRecord(parameters)) return null;
+	const { schema, note } = flattenRootCombinators(parameters);
+	if (schema.type !== "object") return null;
+	return { name: tool.name, description: [note, tool.description].filter(Boolean).join("\n\n"), inputSchema: schema };
+}
+
+const rpcResult = (id: JsonRpcId, result: unknown) => ({ jsonrpc: "2.0", id, result });
+const rpcError = (id: JsonRpcId | null, code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
+
+/** In-flight `tools/call` requests of one connection, for `notifications/cancelled`. */
+type Inflight = Map<JsonRpcId, AbortController>;
+
+export class PiMcpServer {
+	private readonly options: PiMcpServerOptions;
+	private readonly token = randomBytes(24).toString("hex");
+	private http: HttpServer | null = null;
+	private httpPort = 0;
+	private socketServer: NetServer | null = null;
+	private socketDir: string | null = null;
+	private socketPath = "";
+	private readonly sockets = new Map<Socket, string>();
+	private started: Promise<void> | null = null;
+
+	constructor(options: PiMcpServerOptions) {
+		this.options = options;
+	}
+
+	/** Starts both transports once; later calls wait for the first. */
+	start(): Promise<void> {
+		this.started ??= Promise.all([this.startHttp(), this.startSocket()]).then(() => undefined);
+		return this.started;
+	}
+
+	/** The `session/new` entry that connects `agentId` over `transport`. */
+	serverFor(agentId: string, transport: McpTransport): AcpMcpServer {
+		if (transport === "http") {
+			return {
+				type: "http",
+				name: PI_MCP_SERVER,
+				url: `http://127.0.0.1:${this.httpPort}/mcp/${encodeURIComponent(agentId)}`,
+				headers: [{ name: "Authorization", value: `Bearer ${this.token}` }],
+			};
+		}
+		return {
+			name: PI_MCP_SERVER,
+			command: process.execPath,
+			args: [RELAY_PATH, this.socketPath],
+			// The token goes in the environment, which other users cannot read, not in argv.
+			env: [
+				{ name: "PI_MCP_TOKEN", value: this.token },
+				{ name: "PI_MCP_AGENT", value: agentId },
+			],
+		};
+	}
+
+	/** Tells `agentId`'s stdio connections that its tool list changed. */
+	notifyToolsChanged(agentId: string): void {
+		for (const [socket, owner] of this.sockets) {
+			if (owner === agentId) socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })}\n`);
+		}
+	}
+
+	dispose(): void {
+		this.http?.close();
+		this.http?.closeAllConnections();
+		this.socketServer?.close();
+		for (const socket of this.sockets.keys()) socket.destroy();
+		this.sockets.clear();
+		if (this.socketDir) rmSync(this.socketDir, { recursive: true, force: true });
+		this.http = null;
+		this.socketServer = null;
+		this.socketDir = null;
+		this.started = null;
+	}
+
+	/** Answers one JSON-RPC message; null for notifications and responses. */
+	private async handle(message: unknown, agentId: string, inflight: Inflight): Promise<object | null> {
+		if (!isRecord(message) || typeof message.method !== "string") return null;
+		const { method } = message;
+		const id = typeof message.id === "string" || typeof message.id === "number" ? message.id : undefined;
+		const params = isRecord(message.params) ? message.params : {};
+		if (id === undefined) {
+			if (method === "notifications/cancelled") {
+				const requestId = params.requestId;
+				if (typeof requestId === "string" || typeof requestId === "number") inflight.get(requestId)?.abort();
+			}
+			return null;
+		}
+		switch (method) {
+			case "initialize": {
+				const requested = typeof params.protocolVersion === "string" ? params.protocolVersion : "";
+				return rpcResult(id, {
+					protocolVersion: MCP_PROTOCOL_VERSIONS.includes(requested) ? requested : MCP_PROTOCOL_VERSIONS[0],
+					capabilities: { tools: { listChanged: true } },
+					serverInfo: { name: PI_MCP_SERVER, version: "1.0.0" },
+					instructions: "Pi's tools. Pi runs each call itself, with its own approvals and display.",
+				});
+			}
+			case "ping":
+				return rpcResult(id, {});
+			case "tools/list":
+				return rpcResult(id, { tools: this.options.tools(agentId) });
+			case "tools/call": {
+				const name = typeof params.name === "string" ? params.name : "";
+				const args = isRecord(params.arguments) ? params.arguments : {};
+				const controller = new AbortController();
+				inflight.set(id, controller);
+				try {
+					return rpcResult(id, await this.options.call({ agentId, name, arguments: args, signal: controller.signal }));
+				} catch (error) {
+					const text = error instanceof Error ? error.message : String(error);
+					return rpcResult(id, { content: [{ type: "text", text }], isError: true });
+				} finally {
+					inflight.delete(id);
+				}
+			}
+			default:
+				return rpcError(id, -32601, `Method not found: ${method}`);
+		}
+	}
+
+	private startHttp(): Promise<void> {
+		const server = createHttpServer((request, response) => void this.serveHttp(request, response));
+		// A tool call stays open while Pi runs the tool, which can wait on the user.
+		server.requestTimeout = 0;
+		server.timeout = 0;
+		this.http = server;
+		return new Promise((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => {
+				const address = server.address();
+				this.httpPort = typeof address === "object" && address ? address.port : 0;
+				resolve();
+			});
+		});
+	}
+
+	private async serveHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		const match = /^\/mcp\/([^/?]+)/.exec(request.url ?? "");
+		if (!match?.[1]) return void response.writeHead(404).end();
+		if (request.headers.authorization !== `Bearer ${this.token}`) return void response.writeHead(401).end();
+		if (request.method === "DELETE") return void response.writeHead(200).end();
+		// No server-initiated stream: the spec allows 405 for GET.
+		if (request.method !== "POST") return void response.writeHead(405, { Allow: "POST, DELETE" }).end();
+		const agentId = decodeURIComponent(match[1]);
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(chunk as Buffer);
+		let body: unknown;
+		try {
+			body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		} catch {
+			response.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify(rpcError(null, -32700, "Parse error")));
+			return;
+		}
+		const inflight: Inflight = new Map();
+		response.on("close", () => {
+			if (!response.writableFinished) for (const controller of inflight.values()) controller.abort();
+		});
+		const messages = Array.isArray(body) ? body : [body];
+		const replies = (await Promise.all(messages.map((message) => this.handle(message, agentId, inflight)))).filter(
+			(reply): reply is object => reply !== null,
+		);
+		if (replies.length === 0) return void response.writeHead(202).end();
+		response
+			.writeHead(200, { "Content-Type": "application/json" })
+			.end(JSON.stringify(Array.isArray(body) ? replies : replies[0]));
+	}
+
+	private startSocket(): Promise<void> {
+		if (IS_WINDOWS) {
+			this.socketPath = `\\\\.\\pipe\\pi-acp-mcp-${process.pid}-${randomBytes(6).toString("hex")}`;
+		} else {
+			// mkdtemp creates the directory with mode 0700, so only this user can connect.
+			this.socketDir = mkdtempSync(join(tmpdir(), "pi-acp-mcp-"));
+			this.socketPath = join(this.socketDir, "mcp.sock");
+		}
+		const server = createNetServer((socket) => this.serveSocket(socket));
+		this.socketServer = server;
+		return new Promise((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(this.socketPath, () => resolve());
+		});
+	}
+
+	private serveSocket(socket: Socket): void {
+		let agentId: string | null = null;
+		const inflight: Inflight = new Map();
+		socket.on("error", (error) => this.options.log?.(`mcp socket error: ${error.message}`));
+		socket.on("close", () => {
+			this.sockets.delete(socket);
+			for (const controller of inflight.values()) controller.abort();
+		});
+		createInterface({ input: socket }).on("line", (line) => {
+			let message: unknown;
+			try {
+				message = JSON.parse(line);
+			} catch {
+				return;
+			}
+			if (agentId === null) {
+				// The relay's first line authenticates and names the agent.
+				if (!isRecord(message) || message.token !== this.token || typeof message.agent !== "string") {
+					socket.destroy();
+					return;
+				}
+				agentId = message.agent;
+				this.sockets.set(socket, agentId);
+				return;
+			}
+			const owner = agentId;
+			void this.handle(message, owner, inflight).then((reply) => {
+				if (reply && !socket.destroyed) socket.write(`${JSON.stringify(reply)}\n`);
+			});
+		});
+	}
+}

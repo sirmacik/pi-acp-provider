@@ -71,7 +71,7 @@ test("session is created once and reused", async () => {
 test("spec-shaped session updates stream in order and the turn finishes", async () => {
 	const client = makeClient();
 	const { result, updates, reply } = await runPrompt(client, "do the thing");
-	assert.deepEqual(result, { kind: "finished", stopReason: "end_turn" });
+	assert.deepEqual(result, { kind: "finished", stopReason: "end_turn", usage: undefined });
 	assert.deepEqual(
 		updates.map((update) => update.type),
 		["agent_thought_chunk", "tool_call", "tool_call_update", "tool_call_update", "agent_message_chunk", "agent_message_chunk"],

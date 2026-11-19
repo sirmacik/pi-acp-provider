@@ -24,6 +24,11 @@ function fakeAgent(overrides: Partial<AcpAgentConfig> = {}): AcpAgentConfig {
 		args: [fakePath],
 		env: {},
 		authMethod: undefined,
+		piTools: "off",
+		mcpTransport: "stdio",
+		systemPrompt: "prompt",
+		sessionMeta: undefined,
+		ownToolsOffMeta: undefined,
 		...overrides,
 	};
 }
@@ -320,12 +325,14 @@ test("picking a discovered model and thinking level switches the session", async
 	await handle.provider.refreshModels?.(storeContext().context);
 	const smart = handle.provider.getModels().find((model) => model.id === "fake/smart");
 	assert.ok(smart);
-	const first = await collect(handle.provider.streamSimple(smart, userContext("hi"), { reasoning: "high" }));
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }];
+	const first = await collect(handle.provider.streamSimple(smart, normalizeContext({ messages }), { reasoning: "high" }));
 	const done = first.at(-1);
 	assert.ok(done?.type === "done");
 	assert.match(messageText(done.message), /\[model=smart thought=high\]/);
-	// The bare agent model goes back to the agent's default; no reasoning means off.
-	const back = await lastEvent(handle, "again", firstModel(handle));
+	// The bare agent model goes back to the agent's default in the same conversation; no reasoning means off.
+	messages.push(done.message, { role: "user", content: [{ type: "text", text: "again" }], timestamp: Date.now() + 1 });
+	const back = (await collect(handle.provider.streamSimple(firstModel(handle), normalizeContext({ messages }), {}))).at(-1);
 	assert.ok(back?.type === "done");
 	assert.match(messageText(back.message), /\[model=fast thought=none\]/);
 });
