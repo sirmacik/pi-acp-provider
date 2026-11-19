@@ -158,6 +158,9 @@ const zeroUsage = (): Usage => ({
  * WARN: an ACP prompt result sums the usage of every model call in the turn, and each call re-reads the
  * whole context, so the sum overstates the context many times. Pi reads `totalTokens` as the context
  * size, so it takes the agent's `usage_update.used` instead when the agent sent one.
+ * WARN: pi-ai's `isContextOverflow` also reads `input + cacheRead` of a finished message as its prompt
+ * size and auto-compacts when that exceeds the window, so the summed prompt-side counts must not
+ * outgrow `contextUsed` either; a long tool loop otherwise looks like an overflow every turn.
  */
 function addUsage(total: Usage, usage: AcpUsage | undefined, contextUsed?: number): void {
 	if (usage) {
@@ -166,7 +169,19 @@ function addUsage(total: Usage, usage: AcpUsage | undefined, contextUsed?: numbe
 		total.cacheRead += usage.cacheRead;
 		total.cacheWrite += usage.cacheWrite;
 	}
-	total.totalTokens = contextUsed ?? total.input + total.output + total.cacheRead + total.cacheWrite;
+	if (contextUsed === undefined) {
+		total.totalTokens = total.input + total.output + total.cacheRead + total.cacheWrite;
+		return;
+	}
+	total.totalTokens = contextUsed;
+	const prompt = total.input + total.cacheRead + total.cacheWrite;
+	if (prompt <= contextUsed) return;
+	// WHY: scaling keeps the agent's input/cache split (its cache hit ratio) while making the parts add up
+	// to the real context; ACP reports no per-call breakdown to pick the last call's numbers from instead.
+	const scale = contextUsed / prompt;
+	total.input = Math.floor(total.input * scale);
+	total.cacheWrite = Math.floor(total.cacheWrite * scale);
+	total.cacheRead = contextUsed - total.input - total.cacheWrite;
 }
 
 /** Decides a `session/request_permission`; `signal` aborts when the turn is cancelled. */

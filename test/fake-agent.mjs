@@ -12,6 +12,8 @@
  *   - "ONESHOT"     first reports a tool call that is already completed
  *   - "DIFF"        first reports an edit tool call with a diff
  *   - "USAGE"       sends usage_update (used 1234) and a summed prompt `usage`
+ *   - "LONGLOOP"    like USAGE, but a many-call turn whose summed cacheRead is far past the
+ *                   128k window while usage_update reports 100000 ("NOUPDATE" omits it)
  *   - FAKE_SPLIT=1  writes stdout in small split chunks (line-buffer test)
  *   - FAKE_MODELS=config  session/new returns configOptions (model + thought_level)
  *     FAKE_MODELS=legacy  session/new returns the legacy `models` field
@@ -157,6 +159,14 @@ async function handlePrompt(message) {
 	activePrompt = turn;
 	const stepDelay = text.includes("SLOW") ? 150 : 5;
 
+	if (text.includes("LONGLOOP")) {
+		if (!text.includes("NOUPDATE")) update(sessionId, { sessionUpdate: "usage_update", used: 100000, size: 128000 });
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } });
+		return reply(message.id, {
+			stopReason: "end_turn",
+			usage: { inputTokens: 2000, outputTokens: 9000, cachedReadTokens: 4869752, cachedWriteTokens: 120000, totalTokens: 5000752 },
+		});
+	}
 	if (text.includes("USAGE")) {
 		update(sessionId, { sessionUpdate: "usage_update", used: 1234, size: 200000 });
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } });

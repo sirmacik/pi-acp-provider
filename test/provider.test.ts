@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -117,7 +118,36 @@ test("context size comes from usage_update, not the turn's summed usage", async 
 	assert.ok(last?.type === "done");
 	const { usage } = last.message;
 	assert.equal(usage.totalTokens, 1234);
-	assert.deepEqual([usage.input, usage.output, usage.cacheRead, usage.cacheWrite], [10, 20, 30000, 40]);
+	assert.equal(usage.output, 20);
+	assert.equal(usage.input + usage.cacheRead + usage.cacheWrite, 1234);
+});
+
+for (const [label, options] of [
+	["a live turn", {}],
+	["an isolated request", { cacheRetention: "none" }],
+] as const) {
+	test(`a long tool loop's summed usage is not a context overflow (${label})`, async () => {
+		const handle = makeProvider();
+		const model = firstModel(handle);
+		const events = await collect(handle.provider.streamSimple(model, userContext("LONGLOOP please"), options));
+		const last = events.at(-1);
+		assert.ok(last?.type === "done");
+		const { usage } = last.message;
+		assert.equal(usage.totalTokens, 100000);
+		assert.equal(usage.output, 9000);
+		assert.ok(usage.input + usage.cacheRead + usage.cacheWrite <= 100000);
+		assert.ok(usage.input + usage.cacheRead <= model.contextWindow);
+		assert.equal(isContextOverflow(last.message, model.contextWindow), false);
+	});
+}
+
+test("without usage_update the turn's summed usage is reported unchanged", async () => {
+	const handle = makeProvider();
+	const last = await lastEvent(handle, "LONGLOOP NOUPDATE please");
+	assert.ok(last?.type === "done");
+	const { usage } = last.message;
+	assert.deepEqual([usage.input, usage.output, usage.cacheRead, usage.cacheWrite], [2000, 9000, 4869752, 120000]);
+	assert.equal(usage.totalTokens, 5000752);
 });
 
 test("agents run as separate processes with separate sessions", async () => {
