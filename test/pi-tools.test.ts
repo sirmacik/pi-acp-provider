@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -156,6 +157,33 @@ async function abortedStep(handle: AcpProviderHandle, messages: Message[]): Prom
 	assert.ok(last?.type === "error" && last.reason === "aborted", `expected aborted, got ${JSON.stringify(last)}`);
 	return last.error;
 }
+
+test("aborting Pi's run while it runs a Pi tool call aborts the ACP turn and answers the MCP request with an error", async () => {
+	const handle = makeProvider([agent()]);
+	const controller = new AbortController();
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages, undefined, { signal: controller.signal });
+	assert.equal(first.stopReason, "toolUse");
+	const call = first.content.find((block) => block.type === "toolCall");
+	assert.ok(call?.type === "toolCall");
+	controller.abort();
+	await sleep(100);
+	const aborted = { role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: "Operation aborted" }], isError: true, timestamp: ++clock } as Message;
+	messages.push(first, aborted, user("ECHO after"));
+	const next = textOf(await step(handle, messages));
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO after>>> CANCELLEDCALL<<<The turn ended before Pi ran this tool\.>>>$/);
+});
+
+test("a turn spanning several Pi messages leaves no abort listener on Pi's signal once it ends", async () => {
+	const handle = makeProvider([agent()]);
+	const controller = new AbortController();
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages, undefined, { signal: controller.signal });
+	assert.equal(first.stopReason, "toolUse");
+	messages.push(first, ...(await answerTools(handle, first)));
+	assert.equal((await step(handle, messages, undefined, { signal: controller.signal })).stopReason, "stop");
+	assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
 
 test("a cancelled prompt's late updates, permission requests and MCP calls stay out of the next turn", async () => {
 	const asked: string[] = [];

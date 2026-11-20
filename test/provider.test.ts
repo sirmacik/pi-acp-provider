@@ -305,6 +305,23 @@ test("abort mid-stream finalizes as aborted and the session survives", async () 
 	assert.equal((await lastEvent(handle, "still here"))?.type, "done");
 });
 
+test("after a reset, a restarted agent's session that reuses an old id gets the instructions and history again", async () => {
+	const handle = makeProvider();
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "ECHO one" }], timestamp: Date.now() }];
+	const run = async () =>
+		(await collect(handle.provider.streamSimple(firstModel(handle), normalizeContext({ systemPrompt: "SYSTEM-RULES", messages }), {}))).at(-1);
+	const first = await run();
+	assert.ok(first?.type === "done");
+	assert.match(messageText(first.message), /^ECHO\[sess-1\]<<<<system-instructions>/);
+	handle.resetSession(process.cwd());
+	// WHY: the fake numbers sessions per process, so once it restarts its next session is sess-1 again.
+	assert.equal((await lastEvent(handle, "CRASH out"))?.type, "error");
+	messages.push(first.message, { role: "user", content: [{ type: "text", text: "ECHO two" }], timestamp: Date.now() + 1 });
+	const second = await run();
+	assert.ok(second?.type === "done", JSON.stringify(second));
+	assert.match(messageText(second.message), /^ECHO\[sess-1\]<<<<system-instructions>[\s\S]*SYSTEM-RULES[\s\S]*<conversation-history>[\s\S]*ECHO one[\s\S]*ECHO two>>>$/);
+});
+
 test("process crash surfaces as an error and the next prompt recovers", async () => {
 	const handle = makeProvider();
 	const last = await lastEvent(handle, "CRASH out");

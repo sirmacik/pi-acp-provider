@@ -37,6 +37,8 @@
  *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
  *                   when a _session/steering message arrived meanwhile); result
  *                   items are joined with "|", non-text ones as "[<type>:<mimeType>]"
+ *                   (when the prompt was cancelled while the call waited, the next ECHO
+ *                   reports what the call returned as "CANCELLEDCALL<<<text>>>")
  *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
  *   - FAKE_MCP_NAME=<n>  gives that tool call the structured ACP `name` <n>
  *     FAKE_MCP_META_NAME=<n>  and/or `_meta.claudeCode.toolName` <n>
@@ -144,6 +146,8 @@ const activePrompts = new Map();
 let lagReport = null;
 /** The answer a PERMISSION prompt got after it was cancelled, reported by the next ECHO. */
 let cancelledPermission = null;
+/** What an MCPCALL's tools/call returned after its prompt was cancelled, reported by the next ECHO. */
+let cancelledCall = null;
 const sessionParams = new Map();
 const steered = [];
 
@@ -369,7 +373,7 @@ async function handlePrompt(message) {
 	}
 	if (text.includes("ECHO")) {
 		const lag = lagReport === null ? "" : ` LAG<<<${lagReport}>>>`;
-		const stale = `${staleReport === null ? "" : ` STALE<<<${staleReport}>>>`}${cancelledPermission === null ? "" : ` CANCELLEDPERM<<<${cancelledPermission}>>>`}`;
+		const stale = `${staleReport === null ? "" : ` STALE<<<${staleReport}>>>`}${cancelledPermission === null ? "" : ` CANCELLEDPERM<<<${cancelledPermission}>>>`}${cancelledCall === null ? "" : ` CANCELLEDCALL<<<${cancelledCall}>>>`}`;
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>${lag}${stale}` } });
 		promptCounter++;
 		return turn.finish("end_turn");
@@ -430,6 +434,7 @@ async function handlePrompt(message) {
 		}
 		const response = await pending;
 		client.close();
+		if (turn.cancelled) cancelledCall = callText(response);
 		const result = response.result ?? { content: [{ type: "text", text: callText(response) }], isError: true };
 		update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "m1", status: result.isError ? "failed" : "completed" });
 		const resultText = callText(response);

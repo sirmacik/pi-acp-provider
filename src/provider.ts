@@ -438,6 +438,12 @@ interface LiveTurn {
 	acp: AcpClient;
 	sessionId: string;
 	controller: AbortController;
+	/**
+	 * Removes the listener that aborts the turn with the signal of the Pi message last attached.
+	 * WARN: it must outlive that message: while Pi runs a Pi tool call between messages, it is the only
+	 * link that cancels the ACP turn. Only a new `attach`, `settleTurn` or the turn's replacement drops it.
+	 */
+	unbindAbort: (() => void) | undefined;
 	native: boolean;
 	steering: boolean;
 	/** Events that arrived while no Pi message was attached (Pi was running tools). */
@@ -911,6 +917,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 
 		if (live) {
+			live.unbindAbort?.();
 			live.controller.abort();
 			live = null;
 		}
@@ -1061,6 +1068,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			acp,
 			sessionId,
 			controller: new AbortController(),
+			unbindAbort: undefined,
 			native: options.nativeTools?.() === true,
 			steering: info.capabilities.steering,
 			buffer: [],
@@ -1333,10 +1341,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
+	/** Makes `signal` abort the turn, in place of the signal it was bound to. */
+	function bindAbort(turn: LiveTurn, signal: AbortSignal | undefined): void {
+		turn.unbindAbort?.();
+		turn.unbindAbort = undefined;
+		if (signal?.aborted) turn.controller.abort();
+		if (!signal || signal.aborted) return;
+		const onAbort = (): void => turn.controller.abort();
+		signal.addEventListener("abort", onAbort, { once: true });
+		turn.unbindAbort = () => signal.removeEventListener("abort", onAbort);
+	}
+
 	/** Streams the turn into one Pi message until the next tool call or the end of the turn. */
 	function attach(turn: LiveTurn, writer: MessageWriter, signal: AbortSignal | undefined): void {
-		if (signal?.aborted) turn.controller.abort();
-		else signal?.addEventListener("abort", () => turn.controller.abort(), { once: true });
+		bindAbort(turn, turn.outcome ? undefined : signal);
 		const renderTool = createToolRenderer((text) => writer.append("text", text));
 		let ended = false;
 		const endAt = (toolCall: ToolCall): void => {
@@ -1408,6 +1426,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		// Their steers stay in `pendingSteers`, for the next prompt.
 		turn.queued.length = 0;
+		bindAbort(turn, undefined);
 		turn.outcome = outcome;
 		// Mirrored calls the agent never finalized end with what it last reported.
 		for (const entry of turn.tools.values()) notifyWaiters(entry, true);
