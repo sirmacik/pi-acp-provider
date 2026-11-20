@@ -514,8 +514,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/**
 	 * Whether a permission request is for a call of Pi's own tool, judged by structure only (adr-001): it
 	 * comes from the main client on the live turn's session, which holds a bound MCP nonce, and names a
-	 * tool call that session reported and has not finished, by a structured name of a tool Pi serves.
-	 * WARN: titles and `piOwned` are display heuristics an agent or a tool's input can spoof; never use them here.
+	 * tool call that session reported and has not finished; its structured names (the request's and the
+	 * report's) all name one and the same tool Pi serves.
+	 * WARN: titles, `piOwned` and `mirrored` are display state an agent or a tool's input can steer; never use them here.
 	 */
 	function isPiToolPermission(agent: AcpAgentConfig, client: AcpClient, sessionId: string | undefined, params: unknown): boolean {
 		const turn = live;
@@ -534,17 +535,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const toolCall = isRecord(params) && isRecord(params.toolCall) ? params.toolCall : undefined;
 		const id = typeof toolCall?.toolCallId === "string" ? toolCall.toolCallId : undefined;
 		const entry = id === undefined ? undefined : turn.tools.get(id);
-		if (!toolCall || !entry || entry.mirrored || entry.state.status === "completed" || entry.state.status === "failed") return false;
+		if (!toolCall || !entry || entry.state.status === "completed" || entry.state.status === "failed") return false;
 		const meta = isRecord(toolCall._meta) && isRecord(toolCall._meta.claudeCode) ? toolCall._meta.claudeCode : undefined;
 		const asked = typeof toolCall.name === "string" ? toolCall.name : typeof meta?.toolName === "string" ? meta.toolName : undefined;
-		const names = [asked, entry.toolName].filter((name): name is string => name !== undefined);
-		const tools = served.get(agent.id) ?? [];
+		const tools = new Set(
+			[asked, entry.toolName].flatMap((name) => (name === undefined ? [] : [PI_TOOL_NAME.exec(name)?.[1] ?? null])),
+		);
+		const [tool, ...others] = tools;
 		return (
-			names.length > 0 &&
-			names.every((name) => {
-				const tool = PI_TOOL_NAME.exec(name)?.[1];
-				return tool !== undefined && tools.some((candidate) => candidate.name === tool);
-			})
+			typeof tool === "string" &&
+			others.length === 0 &&
+			(served.get(agent.id) ?? []).some((candidate) => candidate.name === tool)
 		);
 	}
 

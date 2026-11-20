@@ -67,10 +67,11 @@ function model(handle: AcpProviderHandle): Model<Api> {
 
 const textOf = (message: AssistantMessage) => message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
 
-/** One provider call; returns the final event, which must be `done`. */
-async function step(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, options: Record<string, unknown> = {}) {
-	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools: [echoTool], messages });
-	const last = (await collect(handle.provider.streamSimple(model(handle), context, options))).at(-1);
+/** One provider call with Pi's `tools` (default: echo); returns the final event, which must be `done`. */
+async function step(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, options: Record<string, unknown> & { tools?: Tool[] } = {}) {
+	const { tools = [echoTool], ...streamOptions } = options;
+	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools, messages });
+	const last = (await collect(handle.provider.streamSimple(model(handle), context, streamOptions))).at(-1);
 	assert.ok(last?.type === "done", `expected done, got ${JSON.stringify(last)}`);
 	return last.message;
 }
@@ -202,8 +203,14 @@ for (const transport of ["stdio", "http"] as const) {
 }
 
 /** A provider whose permission policy records each request's title and allows it. */
-function recordingProvider(env: Record<string, string>, asked: string[], overrides: Partial<AcpAgentConfig> = {}) {
+function recordingProvider(
+	env: Record<string, string>,
+	asked: string[],
+	overrides: Partial<AcpAgentConfig> = {},
+	extra: Omit<AcpProviderOptions, "config" | "permissionPolicy"> = {},
+) {
 	return makeProvider([agent({ env, ...overrides })], {
+		...extra,
 		permissionPolicy: async (request) => {
 			asked.push(request.title);
 			return { outcome: "selected", optionId: "allow" };
@@ -212,13 +219,43 @@ function recordingProvider(env: Record<string, string>, asked: string[], overrid
 }
 
 /** Runs one MCPCALL turn that asks permission for its echo call; returns the final reply text. */
-async function askedEchoTurn(handle: AcpProviderHandle): Promise<string> {
+async function askedEchoTurn(handle: AcpProviderHandle, tools?: Tool[]): Promise<string> {
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} ASKPERM')];
-	const first = await step(handle, messages);
+	const first = await step(handle, messages, undefined, tools ? { tools } : {});
 	assert.equal(first.stopReason, "toolUse");
 	messages.push(first, ...(await answerTools(handle, first)));
-	return textOf(await step(handle, messages));
+	return textOf(await step(handle, messages, undefined, tools ? { tools } : {}));
 }
+
+const shoutTool: Tool = { name: "shout", description: "Shouts text", parameters: Type.Object({ text: Type.String() }) };
+
+test("a permission request naming one served Pi tool for a call reported as another goes to the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_NAME: "mcp__pi__shout" }, asked);
+	const text = await askedEchoTurn(handle, [echoTool, shoutTool]);
+	assert.match(text, /PERM<<<allow>>> TOOLS<<<echo,shout>>> RESULT<<<echoed hi>>>/);
+	assert.deepEqual(asked, ["mcp__pi__echo"]);
+});
+
+test("a structurally named Pi tool call shown as a native row is approved without the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_MCP_TITLE: "Run something", FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, {}, { nativeTools: () => true });
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} ASKPERM')];
+	const names: string[] = [];
+	for (let index = 0; index < 5; index++) {
+		const message = await step(handle, messages);
+		names.push(...message.content.flatMap((block) => (block.type === "toolCall" ? [block.name] : [])));
+		messages.push(message);
+		if (message.stopReason !== "toolUse") {
+			assert.match(textOf(message), /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+			assert.deepEqual(names, ["acp_tool", "echo"], "the ordinary title made the report a native row");
+			assert.deepEqual(asked, []);
+			return;
+		}
+		messages.push(...(await answerTools(handle, message)));
+	}
+	assert.fail("the turn did not end");
+});
 
 for (const [label, env] of [
 	["the permission request's structured name", { FAKE_PERMISSION_NAME: "mcp__pi__echo" }],
