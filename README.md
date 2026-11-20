@@ -140,8 +140,10 @@ Global keys:
 - **Session mapping**: one ACP session per Pi session per agent. Pi sessions
   that stream at the same time in one Pi process (for example an extension's
   side conversation) run in separate ACP sessions of the same agent process,
-  and neither cancels the other's turn; a new request in a Pi session still
-  replaces that session's own running turn. The agent keeps the conversation on its side, so each prompt carries only what it has
+  each with its own Pi tools, and neither cancels the other's turn; streams
+  to different agents never cancel each other either. A new request still
+  replaces the running turn of the same agent in the same Pi session. The
+  agent keeps the conversation on its side, so each prompt carries only what it has
   not seen: every queued user message (with images, when the agent accepts
   them), plus a `<conversation-history>` transcript of any part of Pi's
   history the session missed (a resumed or forked Pi session, another

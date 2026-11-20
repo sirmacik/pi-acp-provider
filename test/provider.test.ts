@@ -287,16 +287,57 @@ async function overlapping(
 	return { slow: await slow, echo };
 }
 
-test("concurrent streams on two agents both complete with their own output", async () => {
-	const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
-	const [fake, other] = handle.provider.getModels();
-	assert.ok(fake && other);
-	const { slow, echo } = await overlapping(handle, { model: fake }, { model: other });
-	assert.ok(slow?.type === "done", `the first stream ends with ${slow?.type}`);
-	assert.match(messageText(slow.message), /Hello world #0/);
-	assert.doesNotMatch(messageText(slow.message), /ECHO/);
-	assert.ok(echo?.type === "done");
-	assert.match(messageText(echo.message), /ECHO\[sess-1\]<<<.*ECHO two/s);
+for (const sessionId of [undefined, "conv"]) {
+	test(`concurrent streams on two agents both complete with their own output (${sessionId ? "same session id" : "no session id"})`, async () => {
+		const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+		const [fake, other] = handle.provider.getModels();
+		assert.ok(fake && other);
+		const { slow, echo } = await overlapping(handle, { model: fake, ...(sessionId ? { sessionId } : {}) }, { model: other, ...(sessionId ? { sessionId } : {}) });
+		assert.ok(slow?.type === "done", `the first stream ends with ${slow?.type}`);
+		assert.match(messageText(slow.message), /Hello world #0/);
+		assert.doesNotMatch(messageText(slow.message), /ECHO/);
+		assert.ok(echo?.type === "done");
+		assert.match(messageText(echo.message), /ECHO\[sess-1\]<<<.*ECHO two/s);
+	});
+}
+
+test("a request replacing one paused in onPayload owns the turn, and the paused one ends aborted", async () => {
+	const handle = makeProvider();
+	const model = firstModel(handle);
+	let release: () => void = () => {};
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let paused: () => void = () => {};
+	const reached = new Promise<void>((resolve) => (paused = resolve));
+	const first = collect(
+		handle.provider.streamSimple(model, userContext("ECHO first"), {
+			sessionId: "conv",
+			onPayload: async () => {
+				paused();
+				await gate;
+				return undefined;
+			},
+		}),
+	);
+	await reached;
+	let started: () => void = () => {};
+	const underWay = new Promise<void>((resolve) => (started = resolve));
+	const second = (async () => {
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of handle.provider.streamSimple(model, userContext("SLOW second"), { sessionId: "conv" })) {
+			events.push(event);
+			if (event.type === "thinking_delta") started();
+		}
+		started();
+		return events.at(-1);
+	})();
+	await underWay;
+	release();
+	const firstLast = (await first).at(-1);
+	assert.ok(firstLast?.type === "error", `the replaced request ends with ${firstLast?.type}`);
+	assert.equal(firstLast.reason, "aborted", firstLast.error.errorMessage ?? "");
+	const secondLast = await second;
+	assert.ok(secondLast?.type === "done", `the replacing request ends with ${secondLast?.type}`);
+	assert.match(messageText(secondLast.message), /Hello world #0/);
 });
 
 test("concurrent streams on two conversations of one agent run in separate sessions", async () => {
@@ -733,4 +774,38 @@ test("native tools: aborting while Pi waits on a mirrored call aborts the turn",
 	const waiting = handle.awaitTool(call.id, controller.signal, () => {});
 	controller.abort();
 	await assert.rejects(waiting, /aborted/);
+});
+
+test("native tools: two conversations' mirrored calls get distinct ids and stay with their own turn", async () => {
+	const handle = makeProvider(undefined, { nativeTools: () => true });
+	const model = firstModel(handle);
+	const opening = async (text: string, sessionId: string) => {
+		const messages: Message[] = [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }];
+		const last = (await collect(handle.provider.streamSimple(model, normalizeContext({ messages }), { sessionId }))).at(-1);
+		assert.ok(last?.type === "done" && last.reason === "toolUse");
+		const call = last.message.content.at(-1);
+		assert.ok(call?.type === "toolCall");
+		return { messages: [...messages, last.message], call };
+	};
+	const a = await opening("go a", "conv-a");
+	const b = await opening("go b", "conv-b");
+	assert.notEqual(a.call.id, b.call.id, "the agent reported both calls as t1");
+	const controller = new AbortController();
+	const waiting = handle.awaitTool(b.call.id, controller.signal, () => {});
+	controller.abort();
+	await assert.rejects(waiting, /aborted/);
+	const result = toToolResult(await handle.awaitTool(a.call.id, undefined, () => {}));
+	assert.equal(result.details.output, "3 matches\nsecond line");
+	a.messages.push({
+		role: "toolResult",
+		toolCallId: a.call.id,
+		toolName: a.call.name,
+		content: result.content,
+		details: result.details,
+		isError: false,
+		timestamp: Date.now(),
+	} as Message);
+	const last = (await collect(handle.provider.streamSimple(model, normalizeContext({ messages: a.messages }), { sessionId: "conv-a" }))).at(-1);
+	assert.ok(last?.type === "done", `conversation a ends with ${last?.type}`);
+	assert.match(messageText(last.message), /^Hello world #\d+$/);
 });

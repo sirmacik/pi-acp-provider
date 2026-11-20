@@ -903,3 +903,43 @@ test("Pi tool calls are recognized in each agent's naming", () => {
 		assert.equal(piToolRef(undefined, title), undefined, title);
 	}
 });
+
+test("two conversations of one agent each list, approve and call their own Pi tools", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_MCP_NAME: "mcp__pi__alpha", FAKE_PERMISSION_NAME: "mcp__pi__alpha" }, asked);
+	const alpha: Tool = { ...echoTool, name: "alpha" };
+	const beta: Tool = { ...echoTool, name: "beta" };
+	let release: () => void = () => {};
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let paused: () => void = () => {};
+	const reached = new Promise<void>((resolve) => (paused = resolve));
+	const messages: Message[] = [user('MCPCALL:alpha:{"text":"a"} ASKPERM')];
+	const first = step(handle, messages, undefined, {
+		tools: [alpha],
+		sessionId: "conv-a",
+		onPayload: async () => {
+			paused();
+			await gate;
+			return undefined;
+		},
+	});
+	await reached;
+	// WHY: conversation b's context lists only beta while conversation a's turn is about to call alpha.
+	assert.match(textOf(await step(handle, [user("ECHO b")], undefined, { tools: [beta], sessionId: "conv-b" })), /ECHO\[/);
+	release();
+	const call = await first;
+	assert.equal(call.stopReason, "toolUse", textOf(call));
+	const block = call.content.at(-1);
+	assert.ok(block?.type === "toolCall" && block.name === "alpha");
+	messages.push(call, {
+		role: "toolResult",
+		toolCallId: block.id,
+		toolName: block.name,
+		content: [{ type: "text", text: "alpha ran" }],
+		isError: false,
+		timestamp: ++clock,
+	} as Message);
+	const last = await step(handle, messages, undefined, { tools: [alpha], sessionId: "conv-a" });
+	assert.match(textOf(last), /PERM<<<allow>>> TOOLS<<<alpha>>> RESULT<<<alpha ran>>>/);
+	assert.deepEqual(asked, [], "conversation a's own tool is approved without the policy");
+});

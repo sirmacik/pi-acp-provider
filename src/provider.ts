@@ -436,10 +436,8 @@ interface PendingSteer {
 const turnKey = (agentId: string, id: string): string => `${agentId}\u0000${id}`;
 
 interface LiveTurn {
-	/** `turnKey(agent id, conversation)`: the turn's slot in `lives` and its pending steers. */
+	/** `turnKey(agent id, Pi's StreamOptions.sessionId or "")`: the turn's slot in `lives`, `claims`, `served` and `pendingSteers`. */
 	key: string;
-	/** Pi's `StreamOptions.sessionId`; "" when Pi sent none. */
-	conversation: string;
 	agent: AcpAgentConfig;
 	modelId: string;
 	acp: AcpClient;
@@ -461,6 +459,11 @@ interface LiveTurn {
 	/** Prompts to send, in order, once the running one ends (steering the agent could not take mid-turn). */
 	queued: TurnPrompt[];
 	tools: Map<string, ToolEntry>;
+	/**
+	 * Mirrored calls by the id Pi knows them by: unique per call, since ACP ids are unique per session at
+	 * best and Pi's tool results and `awaitTool` must find the one turn they belong to.
+	 */
+	mirrors: Map<string, ToolEntry>;
 	/** Pi tool calls still waiting for Pi's result; the agent may cancel one or end the turn first. */
 	piCalls: Map<string, PiCall>;
 	/** Every Pi tool call this turn handed to Pi: Pi answers each, even once its MCP request is gone. */
@@ -594,8 +597,14 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const clients = new Map<string, AcpClient>();
 	/** What each ACP session has seen, by `turnKey(agent id, session id)`: session ids collide across agents. */
 	const sync = new Map<string, SyncState>();
-	/** The tools served to each agent, from the latest Pi context. */
+	/** The tools served to each agent in each conversation, by `LiveTurn.key`, from that conversation's latest Pi context. */
 	const served = new Map<string, McpTool[]>();
+	/** The `served` key each minted MCP nonce lists and calls tools from, until it is revoked. */
+	const nonceServed = new Map<string, string>();
+	const revokeNonce = (nonce: string): void => {
+		nonceServed.delete(nonce);
+		mcp?.revoke(nonce);
+	};
 	let mcp: PiMcpServer | null = null;
 	/** The ACP session each bound MCP nonce belongs to; a call is accepted only for the live turn's session. */
 	const nonceSessions = new Map<string, { agentId: string; sessionId: string }>();
@@ -610,6 +619,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	};
 	/** The ACP turns in progress, by `LiveTurn.key`; each spans several Pi messages. */
 	const lives = new Map<string, LiveTurn>();
+	/**
+	 * The request that owns each `LiveTurn.key`, from before its setup until its turn ends; the controller
+	 * becomes the turn's `controller`. Aborting it supersedes the request, set up or not.
+	 */
+	const claims = new Map<string, AbortController>();
 	/**
 	 * Steers the agent has not accepted yet, and users an `onPayload` hook left out of an accepted prompt,
 	 * oldest first, by `LiveTurn.key`. Kept here rather than in a
@@ -675,7 +689,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return (
 			typeof tool === "string" &&
 			others.length === 0 &&
-			(served.get(agent.id) ?? []).some((candidate) => candidate.name === tool)
+			(served.get(turn.key) ?? []).some((candidate) => candidate.name === tool)
 		);
 	}
 
@@ -686,7 +700,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		for (const [nonce, owner] of nonceSessions) {
 			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
 			nonceSessions.delete(nonce);
-			mcp?.revoke(nonce);
+			revokeNonce(nonce);
 		}
 	}
 
@@ -729,7 +743,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 */
 	async function mcpServer(agent: AcpAgentConfig): Promise<PiMcpServer | null> {
 		if (agent.piTools === "off") return null;
-		mcp ??= new PiMcpServer({ tools: (agentId) => served.get(agentId) ?? [], call: handleMcpCall, log });
+		mcp ??= new PiMcpServer({ tools: (_agentId, nonce) => served.get(nonceServed.get(nonce) ?? "") ?? [], call: handleMcpCall, log });
 		try {
 			await mcp.start();
 			return mcp;
@@ -744,8 +758,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
-	/** Pi's current tools as served to `agent`; tells connected agents when the list changed. */
-	function updateServedTools(agent: AcpAgentConfig, context: TranscriptContext): void {
+	/** Pi's current tools as served to `agent` in the conversation `servedKey`; tells connected agents when the list changed. */
+	function updateServedTools(agent: AcpAgentConfig, servedKey: string, context: TranscriptContext): void {
 		if (agent.piTools === "off") return;
 		const tools = getCurrentTools(context.messages).flatMap((tool) => {
 			if (tool.name === ACP_TOOL_NAME) return [];
@@ -753,13 +767,23 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			if (!mcpTool) log?.(`${agent.id}: tool '${tool.name}' has no object schema and is not offered over MCP`);
 			return mcpTool ? [mcpTool] : [];
 		});
-		const previous = served.get(agent.id);
-		served.set(agent.id, tools);
+		const previous = served.get(servedKey);
+		served.set(servedKey, tools);
 		if (previous && !sameJson(previous, tools)) mcp?.notifyToolsChanged(agent.id);
 	}
 
-	/** `session/new` params for Pi's tools and system prompt, chosen from what the agent advertises. */
-	function sessionSetup(agent: AcpAgentConfig, client: AcpClient, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
+	/**
+	 * `session/new` params for Pi's tools and system prompt, chosen from what the agent advertises; the
+	 * session's MCP nonce serves the tools of the conversation `servedKey`.
+	 */
+	function sessionSetup(
+		agent: AcpAgentConfig,
+		client: AcpClient,
+		server: PiMcpServer | null,
+		servedKey: string,
+		systemPrompt: string,
+		onPrompt: () => void,
+	): SessionSetup {
 		const key = `pi:mcp=${server && agent.piTools !== "off" ? agent.mcpTransport : "none"}`;
 		return {
 			key,
@@ -770,6 +794,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					const transport = agent.mcpTransport === "http" && info.capabilities.mcpHttp ? "http" : "stdio";
 					const nonce = server.mint(agent.id);
 					mintedNonces.set(params, nonce);
+					nonceServed.set(nonce, servedKey);
 					params.mcpServers = [server.serverFor(agent.id, transport, nonce)];
 				}
 				if (agent.systemPrompt === "session" && info.capabilities.systemPrompt && systemPrompt) {
@@ -788,7 +813,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				const nonce = mintedNonces.get(params);
 				if (nonce === undefined) return;
 				mintedNonces.delete(params);
-				if (sessionId === undefined) server?.revoke(nonce);
+				if (sessionId === undefined) revokeNonce(nonce);
 				else nonceSessions.set(nonce, { agentId: agent.id, sessionId });
 			},
 		};
@@ -899,12 +924,12 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			await runIsolated(stream, writer, message, agent, target.modelId, model, context, streamOptions);
 			return;
 		}
-		updateServedTools(agent, context);
+		const conversationId = streamOptions?.sessionId ?? "";
+		const key = turnKey(agent.id, conversationId);
+		updateServedTools(agent, key, context);
 
 		const messages = conversation(context.messages);
 		const tail = messages.slice(tailStart(messages));
-		const conversationId = streamOptions?.sessionId ?? "";
-		const key = turnKey(agent.id, conversationId);
 		const live = lives.get(key);
 		if (live && !live.controller.signal.aborted && continuesLiveTurn(live, tail)) {
 			syncOf(live)?.ownStamps.add(message.timestamp);
@@ -914,13 +939,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 
-		// WHY: a Pi conversation runs one request at a time, so a new one replaces its turn on any agent;
-		// requests without a conversation id share no conversation and leave other agents' turns alone.
-		for (const [otherKey, other] of lives) {
-			if (otherKey !== key && (conversationId === "" || other.conversation !== conversationId)) continue;
-			other.controller.abort();
-			lives.delete(otherKey);
-		}
+		claims.get(key)?.abort();
+		claims.delete(key);
+		lives.delete(key);
 		const users = messages
 			.slice(requestStart(messages))
 			.filter((candidate): candidate is UserMessage => candidate.role === "user");
@@ -928,9 +949,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
 			return;
 		}
+		// WHY: claimed before the first await, so a later request for the key aborts this one even while
+		// it is still setting up, and this one can never publish a turn over the later one's.
+		const claim = new AbortController();
+		claims.set(key, claim);
+		const setupSignal = signal ? AbortSignal.any([signal, claim.signal]) : claim.signal;
 		const acp = getClient(agent);
 		const abortedOrError = (error: unknown): void => {
-			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
+			if (claims.get(key) === claim) claims.delete(key);
+			if (setupSignal.aborted) writer.fail("aborted", "Request was aborted");
 			else if (error instanceof AcpRpcError && error.code === ACP_AUTH_REQUIRED) writer.fail("error", authHint(agent, acp.info));
 			else writer.fail("error", errorMessage(error));
 		};
@@ -942,9 +969,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		let info: AcpAgentInfo;
 		try {
 			const server = await mcpServer(agent);
+			setupSignal.throwIfAborted();
 			let promptInSession = false;
-			const setup = sessionSetup(agent, acp, server, systemPrompt, () => (promptInSession = true));
-			sessionId = await acp.ensureSession({ signal, setup, conversation: conversationId });
+			const setup = sessionSetup(agent, acp, server, key, systemPrompt, () => (promptInSession = true));
+			sessionId = await acp.ensureSession({ signal: setupSignal, setup, conversation: conversationId });
 			let known = sync.get(turnKey(agent.id, sessionId));
 			// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
 			// down would never gain Pi's tools; a new session seeded from Pi's history does.
@@ -958,7 +986,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				sync.delete(turnKey(agent.id, sessionId));
 				acp.resetSession(cwd, conversationId);
 				promptInSession = false;
-				sessionId = await acp.ensureSession({ signal, setup, conversation: conversationId });
+				sessionId = await acp.ensureSession({ signal: setupSignal, setup, conversation: conversationId });
 				known = undefined;
 			}
 			state = known ?? {
@@ -971,8 +999,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
 			sync.set(turnKey(agent.id, sessionId), state);
-			info = acp.info ?? (await acp.ensureReady(signal));
+			info = acp.info ?? (await acp.ensureReady(setupSignal));
 			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions);
+			setupSignal.throwIfAborted();
 		} catch (error) {
 			abortedOrError(error);
 			return;
@@ -1022,6 +1051,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		// WHY: with nothing new, the request is Pi retrying the last one; a recovered steer is new enough.
 		const sentUsers = fresh.length > 0 || late.length > 0 ? fresh : sendable.slice(-1);
 		if (sentUsers.length === 0 && late.length === 0) {
+			if (claims.get(key) === claim) claims.delete(key);
 			writer.fail("error", `No user message left to send to ${agent.name}.`);
 			return;
 		}
@@ -1048,6 +1078,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			const defaultPayload = { sessionId, prompt: blocks };
 			payload = (await streamOptions?.onPayload?.(defaultPayload, model)) ?? defaultPayload;
 			sent = partsIn(parts, payload);
+			setupSignal.throwIfAborted();
 		} catch (error) {
 			abortedOrError(error);
 			return;
@@ -1063,12 +1094,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 		const turn: LiveTurn = {
 			key,
-			conversation: conversationId,
 			agent,
 			modelId: model.id,
 			acp,
 			sessionId,
-			controller: new AbortController(),
+			controller: claim,
 			native: options.nativeTools?.() === true,
 			steering: info.capabilities.steering,
 			buffer: [],
@@ -1078,6 +1108,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			accepting: false,
 			queued: [],
 			tools: new Map(),
+			mirrors: new Map(),
 			piCalls: new Map(),
 			issued: new Set(),
 			usage: zeroUsage(),
@@ -1107,7 +1138,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return tail.some(
 			(candidate) =>
 				candidate.role === "toolResult" &&
-				(turn.issued.has(candidate.toolCallId) || turn.tools.get(candidate.toolCallId)?.mirrored === true),
+				(turn.issued.has(candidate.toolCallId) || turn.mirrors.has(candidate.toolCallId)),
 		);
 	}
 
@@ -1280,7 +1311,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		) {
 			return Promise.reject(new Error("Pi is not running a turn for this agent, so its tools are unavailable."));
 		}
-		if (!(served.get(call.agentId) ?? []).some((tool) => tool.name === call.name)) {
+		if (!(served.get(turn.key) ?? []).some((tool) => tool.name === call.name)) {
 			return Promise.reject(new Error(`Pi has no tool named '${call.name}'.`));
 		}
 		// The agent's own report of this call is shown by Pi's tool row instead.
@@ -1354,10 +1385,12 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				}
 				if (entry.mirrored) return;
 				entry.mirrored = true;
-				syncOf(turn)?.ours.add(event.toolCallId);
+				const id = `acp_${randomUUID()}`;
+				turn.mirrors.set(id, entry);
+				syncOf(turn)?.ours.add(id);
 				endAt({
 					type: "toolCall",
-					id: event.toolCallId,
+					id,
 					name: ACP_TOOL_NAME,
 					arguments: (entry.args ?? { agent: turn.agent.id, title: entry.title ?? "tool" }) as unknown as ToolCall["arguments"],
 				});
@@ -1368,6 +1401,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			ended = true;
 			turn.attached = null;
 			if (lives.get(turn.key) === turn) lives.delete(turn.key);
+			if (claims.get(turn.key) === turn.controller) claims.delete(turn.key);
 			if ("error" in outcome) {
 				if (turn.controller.signal.aborted) writer.fail("aborted", "Request was aborted");
 				else {
@@ -1464,9 +1498,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	const awaitTool: AwaitTool = (toolCallId, signal, onPartial) => {
-		// WARN: Pi names only the tool call id, so two live turns mirroring the same id cannot be told apart.
-		const turn = [...lives.values()].find((candidate) => candidate.tools.get(toolCallId)?.mirrored === true);
-		const entry = turn?.tools.get(toolCallId);
+		const turn = [...lives.values()].find((candidate) => candidate.mirrors.has(toolCallId));
+		const entry = turn?.mirrors.get(toolCallId);
 		if (!turn || !entry) {
 			return Promise.resolve({ status: "failed", content: { text: ["This ACP turn is no longer running."], diffs: [], terminals: [] }, rawOutput: undefined });
 		}
@@ -1596,7 +1629,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		provider,
 		resetSession(nextCwd: string): void {
 			cwd = nextCwd;
-			for (const turn of lives.values()) turn.controller.abort();
+			for (const claim of claims.values()) claim.abort();
+			claims.clear();
 			lives.clear();
 			pendingSteers.clear();
 			for (const client of clients.values()) client.resetSession(nextCwd);
@@ -1605,13 +1639,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		awaitTool,
 		commands: async (agentId) => (await clients.get(agentId)?.currentCommands()) ?? [],
 		dispose(): void {
-			for (const turn of lives.values()) turn.controller.abort();
+			for (const claim of claims.values()) claim.abort();
+			claims.clear();
 			lives.clear();
 			for (const client of clients.values()) client.dispose();
 			clients.clear();
 			sync.clear();
 			pendingSteers.clear();
 			nonceSessions.clear();
+			nonceServed.clear();
 			mcp?.dispose();
 			mcp = null;
 		},

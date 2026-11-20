@@ -60,7 +60,8 @@ export interface McpCall {
 }
 
 export interface PiMcpServerOptions {
-	tools: (agentId: string) => McpTool[];
+	/** The tools offered on `agentId`'s session `nonce`. */
+	tools: (agentId: string, nonce: string) => McpTool[];
 	call: (call: McpCall) => Promise<McpCallResult>;
 	log?: ((message: string) => void) | undefined;
 	/** The largest HTTP body or stdio line accepted, in bytes; larger ones get 413 or a closed connection. */
@@ -391,7 +392,7 @@ export class PiMcpServer {
 			case "ping":
 				return rpcResult(id, {});
 			case "tools/list":
-				return rpcResult(id, { tools: this.options.tools(agentId) });
+				return rpcResult(id, { tools: this.options.tools(agentId, nonce) });
 			case "tools/call": {
 				const name = typeof params.name === "string" ? params.name : "";
 				const args = isRecord(params.arguments) ? params.arguments : {};
