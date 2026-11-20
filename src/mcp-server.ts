@@ -293,10 +293,13 @@ export class PiMcpServer {
 		this.started = null;
 	}
 
-	/** Answers one JSON-RPC message; null for notifications and responses. Never rejects. */
-	private async handle(message: unknown, agentId: string, nonce: string, inflight: Inflight): Promise<object | null> {
+	/**
+	 * Answers one JSON-RPC message; null for notifications and responses. Never rejects.
+	 * A `tools/call` it starts adds its controller to `owned`, so the caller can abort exactly its own calls.
+	 */
+	private async handle(message: unknown, agentId: string, nonce: string, inflight: Inflight, owned?: Set<AbortController>): Promise<object | null> {
 		try {
-			return await this.dispatch(message, agentId, nonce, inflight);
+			return await this.dispatch(message, agentId, nonce, inflight, owned);
 		} catch (error) {
 			const id = isRecord(message) && (typeof message.id === "string" || typeof message.id === "number") ? message.id : null;
 			this.options.log?.(`mcp request failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -304,7 +307,13 @@ export class PiMcpServer {
 		}
 	}
 
-	private async dispatch(message: unknown, agentId: string, nonce: string, inflight: Inflight): Promise<object | null> {
+	private async dispatch(
+		message: unknown,
+		agentId: string,
+		nonce: string,
+		inflight: Inflight,
+		owned: Set<AbortController> | undefined,
+	): Promise<object | null> {
 		if (!isRecord(message) || typeof message.method !== "string") return null;
 		const { method } = message;
 		const id = typeof message.id === "string" || typeof message.id === "number" ? message.id : undefined;
@@ -333,8 +342,11 @@ export class PiMcpServer {
 			case "tools/call": {
 				const name = typeof params.name === "string" ? params.name : "";
 				const args = isRecord(params.arguments) ? params.arguments : {};
+				// WHY: replacing a live id's controller would leave that call uncancellable and let another request abort this one.
+				if (inflight.has(id)) return rpcError(id, -32600, `Request id ${JSON.stringify(id)} is already in use`);
 				const controller = new AbortController();
 				inflight.set(id, controller);
+				owned?.add(controller);
 				try {
 					return rpcResult(id, await this.options.call({ agentId, nonce, name, arguments: args, signal: controller.signal }));
 				} catch (error) {
@@ -342,6 +354,7 @@ export class PiMcpServer {
 					return rpcResult(id, { content: [{ type: "text", text }], isError: true });
 				} finally {
 					inflight.delete(id);
+					owned?.delete(controller);
 				}
 			}
 			default:
@@ -432,14 +445,12 @@ export class PiMcpServer {
 			this.httpSessions.set(sessionKey, session);
 		}
 		const { inflight } = session;
-		const callIds = messages.flatMap((message) =>
-			isRecord(message) && message.method === "tools/call" && (typeof message.id === "string" || typeof message.id === "number") ? [message.id] : [],
-		);
+		const owned = new Set<AbortController>();
 		response.on("close", () => {
 			if (response.writableFinished) return;
-			for (const id of callIds) inflight.get(id)?.abort();
+			for (const controller of owned) controller.abort();
 		});
-		const replies = (await Promise.all(messages.map((message) => this.handle(message, agentId, nonce, inflight)))).filter(
+		const replies = (await Promise.all(messages.map((message) => this.handle(message, agentId, nonce, inflight, owned)))).filter(
 			(reply): reply is object => reply !== null,
 		);
 		if (replies.length === 0) return void response.writeHead(202, headers).end();

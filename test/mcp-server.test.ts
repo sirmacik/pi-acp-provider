@@ -201,6 +201,87 @@ function pendingCalls() {
 	return { call, running };
 }
 
+/** Calls with `{ quick: true }` succeed at once; others stay pending until aborted. `started` lists every call that began. */
+function controlledCalls() {
+	const started: McpCall[] = [];
+	const waiters: (() => void)[] = [];
+	const call = (mcpCall: McpCall) => {
+		started.push(mcpCall);
+		for (const waiter of waiters.splice(0)) waiter();
+		if (mcpCall.arguments.quick === true) return Promise.resolve({ content: [{ type: "text" as const, text: "quick" }] });
+		return new Promise<never>((_resolve, reject) => {
+			mcpCall.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+		});
+	};
+	const startedCount = async (count: number) => {
+		while (started.length < count) await new Promise<void>((resolve) => waiters.push(resolve));
+	};
+	return { call, started, startedCount };
+}
+
+/** Starts a raw POST of `body`; `disconnect` drops it as a client that went away would. */
+function rawPost(url: string, headers: Record<string, string>, body: unknown) {
+	const request = httpRequest(url, { method: "POST", headers });
+	request.on("error", () => {});
+	const responded = once(request, "response").then(async (args) => {
+		const response = args[0] as IncomingMessage;
+		let text = "";
+		for await (const chunk of response) text += chunk;
+		return { status: response.statusCode, json: JSON.parse(text) as Record<string, any> };
+	});
+	responded.catch(() => {});
+	request.end(JSON.stringify(body));
+	return { responded, disconnect: () => request.destroy() };
+}
+
+const callWith = (id: number, args: Record<string, unknown>) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "echo", arguments: args } });
+
+test("http MCP answers 400 with a JSON-RPC parse error to malformed JSON and keeps serving", async () => {
+	const server = await startServer();
+	const endpoint = httpEndpoint(server);
+	await withoutUnhandledRejections(async () => {
+		const response = await fetch(endpoint.url, { method: "POST", headers: endpoint.headers, body: "{\"jsonrpc\": \"2.0\", ", signal: AbortSignal.timeout(2000) });
+		assert.equal(response.status, 400);
+		assert.equal(((await response.json()) as Record<string, any>).error?.code, -32700);
+	});
+	assert.equal((await endpoint.send(listTools)).status, 200);
+});
+
+test("http MCP refuses a tools/call whose id is already running in the MCP session", { timeout: 5000 }, async () => {
+	const calls = controlledCalls();
+	const server = await startServer([], { call: calls.call });
+	const endpoint = httpEndpoint(server);
+	const init = await endpoint.send(initialize);
+	const first = endpoint.send(callWith(7, {}), init.session!);
+	await calls.startedCount(1);
+	const duplicate = await endpoint.send(callWith(7, {}), init.session!);
+	assert.equal(duplicate.json?.error?.code, -32600);
+	assert.equal(calls.started.length, 1, "the duplicate never reaches Pi");
+	assert.equal((await endpoint.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 7 } }, init.session!)).status, 202);
+	assert.ok(calls.started[0]!.signal.aborted, "the first call is still the one cancelled by its id");
+	assert.equal((await first).json?.result?.isError, true);
+});
+
+test("http MCP aborts only the calls of the POST whose client went away", { timeout: 5000 }, async () => {
+	const calls = controlledCalls();
+	const server = await startServer([], { call: calls.call });
+	const endpoint = httpEndpoint(server);
+	const init = await endpoint.send(initialize);
+	const headers = { ...endpoint.headers, "mcp-session-id": init.session! };
+	const batch = rawPost(endpoint.url, headers, [callWith(7, { quick: true }), callWith(8, {})]);
+	await calls.startedCount(2);
+	await new Promise((resolve) => setImmediate(resolve));
+	const other = rawPost(endpoint.url, headers, callWith(7, {}));
+	await calls.startedCount(3);
+	batch.disconnect();
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.ok(calls.started[1]!.signal.aborted, "the gone POST's pending call");
+	assert.equal(calls.started[2]!.signal.aborted, false, "another POST's call that reuses a finished id");
+	other.disconnect();
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.ok(calls.started[2]!.signal.aborted);
+});
+
 test("http MCP answers 400 to a malformed agent path and keeps serving", async () => {
 	const server = await startServer();
 	const endpoint = httpEndpoint(server);
