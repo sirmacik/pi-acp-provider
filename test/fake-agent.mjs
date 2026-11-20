@@ -37,8 +37,10 @@
  *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
  *                   when a _session/steering message arrived meanwhile); result
  *                   items are joined with "|", non-text ones as "[<type>:<mimeType>]"
- *                   (when the prompt was cancelled while the call waited, the next ECHO
- *                   reports what the call returned as "CANCELLEDCALL<<<text>>>")
+ *   - "CALLREPORT"  with ECHO: first waits (up to 2s) until the last MCPCALL's tools/call got its
+ *                   answer and its prompt got session/cancel, in whichever order they arrived, then
+ *                   adds "CANCELLEDCALL<<<text>>>" (the call's answer), "UNCANCELLEDCALL<<<text>>>"
+ *                   when no cancel came, or "CANCELLEDCALL<<<none>>>" without an MCPCALL
  *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
  *   - FAKE_MCP_NAME=<n>  gives that tool call the structured ACP `name` <n>
  *     FAKE_MCP_META_NAME=<n>  and/or `_meta.claudeCode.toolName` <n>
@@ -146,8 +148,8 @@ const activePrompts = new Map();
 let lagReport = null;
 /** The answer a PERMISSION prompt got after it was cancelled, reported by the next ECHO. */
 let cancelledPermission = null;
-/** What an MCPCALL's tools/call returned after its prompt was cancelled, reported by the next ECHO. */
-let cancelledCall = null;
+/** The last MCPCALL's tools/call answer and its prompt's session/cancel, reported by a CALLREPORT ECHO. */
+let lastCall = null;
 const sessionParams = new Map();
 const steered = [];
 
@@ -327,16 +329,28 @@ function askPermission(sessionId, toolCallId, title) {
 	});
 }
 
+async function callReport() {
+	if (!lastCall) return "CANCELLEDCALL<<<none>>>";
+	const { answer, cancelSeen } = lastCall;
+	const cancelled = await Promise.race([cancelSeen.then(() => true), sleep(2000).then(() => false)]);
+	const text = await Promise.race([answer, sleep(2000).then(() => "timeout")]);
+	return `${cancelled ? "" : "UN"}CANCELLEDCALL<<<${text}>>>`;
+}
+
 async function handlePrompt(message) {
 	const { sessionId } = message.params;
 	await sendStaleTraffic();
 	const text = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
+	const cancelSeen = Promise.withResolvers();
 	const turn = {
 		ignoreCancel: IGNORE_CANCEL || text.includes("IGNORE-CANCEL"),
 		sessionId,
 		finished: false,
 		/** Set by session/cancel: the turn stops its scripted steps. */
 		cancelled: false,
+		/** Resolves on session/cancel, even one that arrives after the turn finished. */
+		cancelSeen: cancelSeen.promise,
+		markCancelSeen: cancelSeen.resolve,
 		finish(stopReason) {
 			if (this.finished) return;
 			this.finished = true;
@@ -373,7 +387,7 @@ async function handlePrompt(message) {
 	}
 	if (text.includes("ECHO")) {
 		const lag = lagReport === null ? "" : ` LAG<<<${lagReport}>>>`;
-		const stale = `${staleReport === null ? "" : ` STALE<<<${staleReport}>>>`}${cancelledPermission === null ? "" : ` CANCELLEDPERM<<<${cancelledPermission}>>>`}${cancelledCall === null ? "" : ` CANCELLEDCALL<<<${cancelledCall}>>>`}`;
+		const stale = `${staleReport === null ? "" : ` STALE<<<${staleReport}>>>`}${cancelledPermission === null ? "" : ` CANCELLEDPERM<<<${cancelledPermission}>>>`}${text.includes("CALLREPORT") ? ` ${await callReport()}` : ""}`;
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>${lag}${stale}` } });
 		promptCounter++;
 		return turn.finish("end_turn");
@@ -412,6 +426,7 @@ async function handlePrompt(message) {
 			return turn.finish("end_turn");
 		}
 		const { client, tools, result: pending } = await startMcpCall(server, tool, args);
+		lastCall = { answer: pending.then(callText), cancelSeen: turn.cancelSeen };
 		if (process.env.FAKE_MCP_CANCEL === "1" || process.env.FAKE_MCP_GIVEUP === "1") {
 			// WHY: long enough for the provider to hand the call to Pi before the agent stops waiting.
 			await sleep(50);
@@ -434,7 +449,8 @@ async function handlePrompt(message) {
 		}
 		const response = await pending;
 		client.close();
-		if (turn.cancelled) cancelledCall = callText(response);
+		// WHY: a prompt that already answered `cancelled` sends nothing more, or it would reach the next one.
+		if (turn.finished) return;
 		const result = response.result ?? { content: [{ type: "text", text: callText(response) }], isError: true };
 		update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "m1", status: result.isError ? "failed" : "completed" });
 		const resultText = callText(response);
@@ -608,6 +624,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 		}
 		case "session/cancel": {
 			const running = activePrompts.get(message.params?.sessionId);
+			running?.markCancelSeen();
 			if (!running || running.finished) break;
 			running.cancelled = true;
 			if (running.ignoreCancel) linger(running);

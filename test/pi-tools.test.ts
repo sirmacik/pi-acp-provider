@@ -167,11 +167,10 @@ test("aborting Pi's run while it runs a Pi tool call aborts the ACP turn and ans
 	const call = first.content.find((block) => block.type === "toolCall");
 	assert.ok(call?.type === "toolCall");
 	controller.abort();
-	await sleep(100);
 	const aborted = { role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: "Operation aborted" }], isError: true, timestamp: ++clock } as Message;
-	messages.push(first, aborted, user("ECHO after"));
+	messages.push(first, aborted, user("ECHO CALLREPORT after"));
 	const next = textOf(await step(handle, messages));
-	assert.match(next, /^ECHO\[sess-1\]<<<ECHO after>>> CANCELLEDCALL<<<The turn ended before Pi ran this tool\.>>>$/);
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO CALLREPORT after>>> CANCELLEDCALL<<<The turn ended before Pi ran this tool\.>>>$/);
 });
 
 test("a turn spanning several Pi messages leaves no abort listener on Pi's signal once it ends", async () => {
