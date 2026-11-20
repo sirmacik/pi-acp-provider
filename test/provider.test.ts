@@ -870,3 +870,32 @@ test("a replacement's model is applied after a superseded request's settings cha
 	assert.ok(replacement?.type === "done", `the replacement ends with ${replacement?.type}`);
 	assert.match(messageText(replacement.message), /\[model=fast /);
 });
+
+test("a hook that aborts its request and rejects ends the stream as aborted without an unhandled rejection", async () => {
+	const handle = makeProvider();
+	const unhandled: unknown[] = [];
+	const record = (reason: unknown): void => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", record);
+	try {
+		const controller = new AbortController();
+		const last = (
+			await collect(
+				handle.provider.streamSimple(firstModel(handle), userContext("ECHO hook"), {
+					signal: controller.signal,
+					onPayload: () => {
+						controller.abort();
+						return Promise.reject(new Error("hook failed"));
+					},
+				}),
+			)
+		).at(-1);
+		assert.ok(last?.type === "error");
+		assert.equal(last.reason, "aborted");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.deepEqual(unhandled.map(String), []);
+	} finally {
+		process.off("unhandledRejection", record);
+	}
+});

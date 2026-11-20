@@ -201,7 +201,12 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
 /** Rejects as soon as `signal` aborts; the underlying work keeps running. */
 export function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
 	if (!signal) return promise;
-	if (signal.aborted) return Promise.reject(abortError());
+	if (signal.aborted) {
+		// WHY: the work may already have failed (a hook that aborted the request and rejected); unobserved,
+		// its rejection would be unhandled.
+		promise.catch(() => {});
+		return Promise.reject(abortError());
+	}
 	return new Promise<T>((resolve, reject) => {
 		const onAbort = () => reject(abortError());
 		signal.addEventListener("abort", onAbort, { once: true });

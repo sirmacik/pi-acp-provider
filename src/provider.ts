@@ -609,7 +609,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	};
 	let mcp: PiMcpServer | null = null;
 	/** The ACP session each bound MCP nonce belongs to; a call is accepted only for the live turn's session. */
-	const nonceSessions = new Map<string, { agentId: string; sessionId: string }>();
+	const nonceSessions = new Map<string, { agentId: string; sessionId: string; instance: SessionInstance | undefined }>();
 	/** The MCP nonce minted for each `session/new` params object, until the session is bound or fails. */
 	const mintedNonces = new WeakMap<Record<string, unknown>, string>();
 	/** The `SessionSetup.key` (Pi tool wiring) each main-client session was opened with, by client and session id. */
@@ -632,9 +632,12 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * `SyncState`, so they outlive a replaced or re-seeded session and reach its next prompt.
 	 */
 	const pendingSteers = new Map<string, PendingSteer[]>();
+	// WARN: session ids repeat once an agent respawns, and a turn parked at a Pi tool call outlives its
+	// process; routing and sync lookups must match the session instance, never the id alone.
+	const isCurrent = (turn: LiveTurn): boolean => turn.instance !== undefined && turn.instance === turn.acp.instance(turn.sessionId);
 	const liveOn = (client: AcpClient, sessionId: string | undefined): LiveTurn | undefined =>
-		[...lives.values()].find((turn) => turn.acp === client && turn.sessionId === sessionId);
-	const syncOf = (turn: LiveTurn): SyncState | undefined => sync.get(turnKey(turn.agent.id, turn.sessionId));
+		[...lives.values()].find((turn) => turn.acp === client && turn.sessionId === sessionId && isCurrent(turn));
+	const syncOf = (turn: LiveTurn): SyncState | undefined => (isCurrent(turn) ? sync.get(turnKey(turn.agent.id, turn.sessionId)) : undefined);
 
 	const answerServerRequest = async (
 		agent: AcpAgentConfig,
@@ -677,7 +680,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		) {
 			return false;
 		}
-		if (![...nonceSessions.values()].some((owner) => owner.agentId === agent.id && owner.sessionId === sessionId)) return false;
+		if (![...nonceSessions.values()].some((owner) => owner.agentId === agent.id && owner.sessionId === sessionId && owner.instance === turn.instance)) return false;
 		const toolCall = isRecord(params) && isRecord(params.toolCall) ? params.toolCall : undefined;
 		const id = typeof toolCall?.toolCallId === "string" ? toolCall.toolCallId : undefined;
 		const entry = id === undefined ? undefined : turn.tools.get(id);
@@ -816,7 +819,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				if (nonce === undefined) return;
 				mintedNonces.delete(params);
 				if (sessionId === undefined) revokeNonce(nonce);
-				else nonceSessions.set(nonce, { agentId: agent.id, sessionId });
+				else nonceSessions.set(nonce, { agentId: agent.id, sessionId, instance: client.instance(sessionId) });
 			},
 		};
 	}
@@ -1313,7 +1316,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/** An MCP `tools/call` from the agent: becomes a Pi tool call in the running turn. */
 	function handleMcpCall(call: McpCall): Promise<McpCallResult> {
 		const owner = nonceSessions.get(call.nonce);
-		const turn = owner && [...lives.values()].find((candidate) => candidate.agent.id === owner.agentId && candidate.sessionId === owner.sessionId);
+		const turn =
+			owner &&
+			[...lives.values()].find(
+				(candidate) => candidate.agent.id === owner.agentId && candidate.instance === owner.instance && isCurrent(candidate),
+			);
 		if (
 			!turn ||
 			turn.agent.id !== call.agentId ||

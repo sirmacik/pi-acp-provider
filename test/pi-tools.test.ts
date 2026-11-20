@@ -965,3 +965,36 @@ test("a pending steer stays with its conversation while a sibling conversation o
 	const next = await capture(handle, messages, undefined, undefined, conversationA);
 	assert.match(next.prompt, /^Delivered late: [^\n]*\ntwo\nECHO three$/);
 });
+
+test("after a respawn reuses a session id, a turn parked at a native tool call does not capture the new session's calls", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, {}, { nativeTools: () => true });
+	const parked: Message[] = [user("SLOW go a")];
+	const opening = await step(handle, parked, undefined, { sessionId: "conv-a" });
+	assert.equal(opening.stopReason, "toolUse");
+	const mirrored = opening.content.at(-1);
+	assert.ok(mirrored?.type === "toolCall" && mirrored.name === "acp_tool");
+	const crashing: Message[] = [user("CRASH now")];
+	const crashCall = await step(handle, crashing, undefined, { sessionId: "conv-b" });
+	assert.equal(crashCall.stopReason, "toolUse");
+	// WHY: the continuation ends only once the turn settles, which is when the agent's exit is seen.
+	crashing.push(crashCall, ...(await answerTools(handle, crashCall)));
+	const crashed = (await collect(handle.provider.streamSimple(model(handle), normalizeContext({ tools: [echoTool], messages: crashing }), { sessionId: "conv-b" }))).at(-1);
+	assert.ok(crashed?.type === "error");
+	assert.match(crashed.error.errorMessage ?? "", /exited unexpectedly/);
+
+	const fresh: Message[] = [user('MCPCALL:echo:{"text":"hi"} ASKPERM')];
+	const call = await step(handle, fresh, undefined, { sessionId: "conv-c" });
+	assert.equal(call.stopReason, "toolUse", textOf(call));
+	fresh.push(call, ...(await answerTools(handle, call)));
+	const answered = await step(handle, fresh, undefined, { sessionId: "conv-c" });
+	assert.match(textOf(answered), /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+	assert.deepEqual(asked, [], "the new session's own Pi tool is approved without the policy");
+
+	parked.push(opening, ...(await answerTools(handle, opening)));
+	const late = (await collect(handle.provider.streamSimple(model(handle), normalizeContext({ tools: [echoTool], messages: parked }), { sessionId: "conv-a" }))).at(-1);
+	assert.equal(late?.type, "error", "the parked turn ends with its agent's exit");
+	fresh.push(answered, user("ECHO after"));
+	const after = await step(handle, fresh, undefined, { sessionId: "conv-c" });
+	assert.match(textOf(after), /^ECHO\[sess-1\]<<<ECHO after>>>$/, "conversation c keeps its session, which reuses the parked turn's id");
+});
