@@ -143,13 +143,16 @@ Global keys:
   them), plus a `<conversation-history>` transcript of any part of Pi's
   history the session missed (a resumed or forked Pi session, another
   model's turns, a branch the session did not see). When Pi's history no
-  longer holds the session's latest reply, including an aborted one, or a
-  reply or tool result the session got in a `<conversation-history>`
-  transcript (tree navigation or a fork to an earlier point, even one that
-  keeps an earlier reply), or its first message changed (compaction), the
-  provider starts a new ACP session from Pi's history. A user message counts
-  only once a later request still holds it, so one that a Pi extension adds
-  to a single request does not start a new session.
+  longer holds the session's latest reply, including an aborted one (tree
+  navigation or a fork to an earlier point, even one that keeps an earlier
+  reply), or a message the session received that a later request still held,
+  or its first message changed (compaction), the provider starts a new ACP
+  session from Pi's history. Pi does not say which messages it saved and
+  which an extension added to one request only, so a message the session
+  received counts only once a later request still holds it, and only if the
+  session actually saw it (a transcript leaves out empty replies and cuts the
+  oldest part when it is too long). An edit that removes a message before a
+  later request has held it is not noticed.
 - **Pi's tools**: Pi's current tools are served by an MCP server inside Pi,
   as the server `pi` (`mcp__pi__<tool>` in Claude Code). A call ends the Pi
   message with a real Pi tool call; Pi runs it and the result answers the

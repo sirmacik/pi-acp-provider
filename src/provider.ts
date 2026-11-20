@@ -81,6 +81,7 @@ import {
 	messageKey,
 	renderTranscript,
 	tagged,
+	transcriptOf,
 	userBlocks,
 	type AcpContentBlock,
 } from "./transcript.ts";
@@ -496,10 +497,14 @@ interface SyncState {
 	 * WHY: `error` replies are left out because Pi omits a retried one from context; `aborted` ones it keeps.
 	 */
 	lastStreamed: number | undefined;
+	/** Keys of the `seeded` messages the accepted seeds rendered: the ones the session actually read. */
+	shown: Set<string>;
 	/**
-	 * Keys of accepted history Pi's history must still hold: seeded replies and tool results at once, and
-	 * user messages (delivered or seeded) once a later request still holds them.
-	 * WHY: a Pi `context` handler may add a user message for one request only; it must not count as removed.
+	 * Keys of delivered users and `shown` messages that a later request still held, so Pi's history keeps
+	 * them; one missing means the history was edited.
+	 * WHY: a Pi `context` handler may add a message of any role for one request only, and nothing tells it
+	 * from persisted history, so a message counts only once it is seen again. An edit that drops one before
+	 * that goes unnoticed.
 	 */
 	kept: Set<string>;
 	/** The Pi system prompt the session last received. */
@@ -975,6 +980,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				delivered: new Set(),
 				seeded: new Set(),
 				lastStreamed: undefined,
+				shown: new Set(),
 				kept: new Set(),
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
@@ -1007,17 +1013,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			.filter((candidate) => !isOwn(state, candidate) && !isHeld(candidate) && !requestUsers.has(candidate as UserMessage));
 		/** How much of `history` the session holds once the prompt is accepted. */
 		let heldHistory = history.length;
-		const transcript = renderTranscript(unseen);
+		const { text: transcript, shown } = transcriptOf(unseen);
 		if (transcript) {
 			const intro = "Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:";
 			parts.push(
 				promptPart(
 					[tagged("conversation-history", transcript, intro)],
 					() => {
-						for (const seen of unseen) {
-							state.seeded.add(messageKey(seen));
-							if (seen.role !== "user") state.kept.add(messageKey(seen));
-						}
+						for (const seen of unseen) state.seeded.add(messageKey(seen));
+						for (const seen of shown) state.shown.add(messageKey(seen));
 					},
 					// WHY: the anchor must stay before history the session never got, or later prompts skip it.
 					{ omit: () => (heldHistory = history.indexOf(unseen[0]!)) },
@@ -1117,11 +1121,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return [...state.kept].some((key) => !keys.has(key));
 	}
 
-	/** Adds to `kept` the users an earlier request delivered or seeded that Pi's history still holds. */
+	/** Adds to `kept` what earlier requests delivered or showed the session that Pi's history still holds. */
 	function keepConfirmed(state: SyncState, messages: readonly Message[]): void {
 		for (const message of messages) {
 			const key = messageKey(message);
-			if (message.role === "user" && (state.delivered.has(key) || state.seeded.has(key))) state.kept.add(key);
+			if (state.delivered.has(key) || state.shown.has(key)) state.kept.add(key);
 		}
 	}
 

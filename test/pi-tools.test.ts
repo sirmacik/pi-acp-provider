@@ -551,13 +551,15 @@ test("a context edit that drops a user a later request still held starts a new s
 	assert.notEqual(sessionOf(edited.message), "sess-1");
 });
 
-test("a context edit that drops a foreign reply from an accepted seed starts a new session", async () => {
+test("a context edit that drops a seeded foreign reply a later request still held starts a new session", async () => {
 	const handle = makeProvider([agent()]);
-	const other = foreignReply("answer from another model");
-	const messages: Message[] = [user("earlier question"), other, user("ECHO two")];
+	const messages: Message[] = [user("earlier question"), foreignReply("answer from another model"), user("ECHO two")];
 	const second = await step(handle, messages);
 	assert.match(textOf(second), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*answer from another model/);
-	const edited = await capture(handle, [messages[0]!, messages[2]!, second, user("ECHO three")]);
+	messages.push(second, user("ECHO three"));
+	const third = await step(handle, messages);
+	assert.match(textOf(third), /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+	const edited = await capture(handle, [...messages.filter((message) => message !== messages[1]), third, user("ECHO four")]);
 	assert.equal(edited.message.stopReason, "stop");
 	assert.notEqual(sessionOf(edited.message), "sess-1");
 	assert.match(edited.prompt, /^<conversation-history>\n[^\n]*\n\n\[user\]\nearlier question\n\n\[user\]\nECHO two\n\n\[assistant\]\nECHO\[sess-1\]/, "the seed goes from the first user straight to the next one");
@@ -573,6 +575,34 @@ test("user messages a context handler adds for one request only do not start a n
 	messages.push(injected, user("ECHO three"));
 	const next = textOf(await step(handle, messages));
 	assert.match(next, /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+});
+
+test("an assistant reply a context handler adds for one request only does not start a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const injected = await step(handle, [messages[0]!, foreignReply("one-shot synthetic reply"), first, messages[2]!]);
+	assert.match(textOf(injected), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*one-shot synthetic reply[\s\S]*<\/conversation-history>ECHO two>>>$/);
+	messages.push(injected, user("ECHO three"));
+	const next = textOf(await step(handle, messages));
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+});
+
+test("seeded replies the transcript left out do not count as removed history", async () => {
+	const handle = makeProvider([agent()]);
+	const huge = foreignReply(`HUGE ${"x".repeat(130_000)}`);
+	const thinking = { ...(foreignReply("") as AssistantMessage), content: [{ type: "thinking", thinking: "hidden thoughts" }] } as Message;
+	const messages: Message[] = [user("earlier question"), huge, thinking, foreignReply("answer from another model"), user("ECHO two")];
+	const second = await step(handle, messages);
+	assert.match(textOf(second), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*\[2 earlier message\(s\) omitted\][\s\S]*answer from another model/);
+	assert.doesNotMatch(textOf(second), /HUGE|hidden thoughts/);
+	messages.push(second, user("ECHO three"));
+	const third = await step(handle, messages);
+	assert.match(textOf(third), /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+	messages.push(third, user("ECHO four"));
+	const edited = textOf(await step(handle, messages.filter((message) => message !== huge && message !== thinking)));
+	assert.match(edited, /^ECHO\[sess-1\]<<<ECHO four>>>$/);
 });
 
 test("compaction, which replaces the first message, starts a new session", async () => {
