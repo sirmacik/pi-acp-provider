@@ -971,12 +971,18 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			turn.piCalls.delete(result.toolCallId);
 			const reply = toMcpResult(result);
 			if (!steerDelivered && index === results.length - 1) {
-				reply.content.push({
-					type: "text",
-					text: `<user-message>\nThe user sent this while the tool ran. Take it into account now:\n${steerBlocks
-						.map((block) => (block.type === "text" ? block.text : "[image]"))
-						.join("\n")}\n</user-message>`,
-				});
+				// WHY: MCP results carry images whatever the agent's prompt capabilities say.
+				const blocks = steers.flatMap((steer) => userBlocks(steer, true));
+				const texts = blocks.flatMap((block) => (block.type === "text" ? [block.text] : []));
+				const images = blocks.flatMap((block) => (block.type === "image" ? [block] : []));
+				const attached = images.length > 0 ? `\n[${images.length} image(s) attached after this message]` : "";
+				reply.content.push(
+					{
+						type: "text",
+						text: `<user-message>\nThe user sent this while the tool ran. Take it into account now:\n${texts.join("\n")}${attached}\n</user-message>`,
+					},
+					...images,
+				);
 				steerDelivered = true;
 				deliverSteers(turn.agent.id, state, steerKeys);
 			}

@@ -164,7 +164,7 @@ Global keys:
 - **Queue and steering**: a message Pi queues while the agent works reaches
   the running turn with `_session/steering` when the agent advertises it
   (Claude Code, Codex). Otherwise it rides on the Pi tool result the agent is
-  waiting for, or, when none is pending, is sent as the next prompt once the
+  waiting for (its images as MCP image items), or, when none is pending, is sent as the next prompt once the
   running one ends. The running turn is not cancelled. A queued message
   counts as delivered only once the agent accepts the prompt that carries it.
   If that turn ends early (`max_tokens`, an abort, an error, a replaced

@@ -308,6 +308,23 @@ test("without steering support, a steer rides on the Pi tool result", async () =
 	assert.doesNotMatch(last, /STEERED/);
 });
 
+test("without steering support, a steer's image rides on the Pi tool result as an MCP image", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages);
+	const steer: Message = {
+		role: "user",
+		content: [
+			{ type: "text", text: "STEER-NOW" },
+			{ type: "image", data: "aGk=", mimeType: "image/png" },
+		],
+		timestamp: ++clock,
+	};
+	messages.push(first, ...(await answerTools(handle, first)), steer);
+	const last = textOf(await step(handle, messages));
+	assert.match(last, /RESULT<<<echoed hi\|<user-message>[\s\S]*STEER-NOW[\s\S]*<\/user-message>\|\[image:image\/png\]>>>/);
+});
+
 test("a steer after the agent's own tool call is sent as the next prompt once the turn ends", async () => {
 	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
 	const messages: Message[] = [user("hello")];
