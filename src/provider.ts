@@ -1191,7 +1191,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** Records the turn's settled Pi message as the session's latest reply, if Pi keeps it in context. */
 	function noteStreamed(turn: LiveTurn, message: AssistantMessage): void {
-		const state = sync.get(turn.sessionId);
+		const state = syncOf(turn);
 		if (!state?.ownStamps.has(message.timestamp) || message.stopReason === "error") return;
 		state.lastStreamed = message.timestamp;
 	}
