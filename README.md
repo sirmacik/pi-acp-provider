@@ -165,7 +165,16 @@ Global keys:
   the running turn with `_session/steering` when the agent advertises it
   (Claude Code, Codex). Otherwise it rides on the Pi tool result the agent is
   waiting for, or, when none is pending, is sent as the next prompt once the
-  running one ends. The running turn is not cancelled.
+  running one ends. The running turn is not cancelled. A queued message
+  counts as delivered only once the agent accepts the prompt that carries it.
+  If that turn ends early (`max_tokens`, an abort, an error, a replaced
+  session) or the agent rejects the prompt, the message goes with the next
+  prompt instead, after a one-line note that it arrives late, and never as
+  part of a `<conversation-history>` transcript. A message the agent rejected
+  twice is dropped, and the error says so. A message no longer on Pi's
+  active branch (after a fork or tree navigation) is not sent. The same holds
+  for the rest of a prompt: a prompt the agent rejected, or one an `onPayload`
+  hook failed on, is sent in full again with the next request.
 - **Isolated requests**: compaction and branch summaries (`cacheRetention:
   "none"`) run in a separate, throwaway agent process, so the live session
   is not touched. They get no Pi tools, and when the agent has
