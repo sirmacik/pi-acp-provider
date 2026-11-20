@@ -143,9 +143,12 @@ Global keys:
   agent's MCP request, and the ACP turn continues. A changed loadout is served
   on the next `tools/list` (stdio connections also get `list_changed`).
   The HTTP transport listens on 127.0.0.1 and the stdio relay uses a socket in
-  a private temp directory; both need a per-process random token. Permission
-  requests for Pi's tools are approved, since Pi applies its own approval
-  when it runs them.
+  a private temp directory; both need a per-process random token. Each ACP
+  session also gets its own nonce (in the HTTP path, or `PI_MCP_SESSION` for
+  the relay). A call is accepted only from the session of the running turn,
+  and an ended session's nonce is revoked: HTTP answers 403 and its relay
+  connections are closed. Permission requests for Pi's tools are approved,
+  since Pi applies its own approval when it runs them.
 - **System prompt**: Pi's system prompt goes to each ACP session once (see
   `systemPrompt`), and a changed prompt is sent with the next prompt.
 - **Queue and steering**: a message Pi queues while the agent works reaches
@@ -175,8 +178,15 @@ Global keys:
 - **Abort**: Pi's abort signal (Ctrl+C) sends `session/cancel` and finalizes
   the message as aborted immediately. It answers any open permission prompt
   with `cancelled` and leaves the session usable. The next prompt waits (up to
-  5 s) for the agent to confirm the cancellation, so late updates can't leak
-  into it.
+  5 s) for the agent to confirm the cancellation; until then the cancelled
+  prompt's updates are dropped and its permission requests answered
+  `cancelled`, so they can't leak into the next prompt. If the agent does not
+  confirm in time, the provider gives up on that session: it ends it, revokes
+  its MCP nonce, and sends the next prompt on a new session, which first gets
+  the conversation so far as a transcript. The old session's later updates,
+  permission requests and Pi tool calls are refused. If this happens twice in
+  a row, or the new session fails to open, the agent process is restarted
+  instead.
 - **Permissions**: `session/request_permission` is auto-approved by default
   (`allow_once`, never `allow_always`). Set `autoApproveTools: false` to get an
   interactive select dialog that names the asking agent.

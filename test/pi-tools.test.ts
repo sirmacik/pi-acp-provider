@@ -158,6 +158,32 @@ test("a cancelled prompt's late updates, permission requests and MCP calls stay 
 	assert.deepEqual((await handle.commands("fake")).map((command) => command.name), ["context", "session"]);
 });
 
+for (const transport of ["stdio", "http"] as const) {
+	test(`a session whose cancel never drains is replaced and its later ${transport} MCP, permission and update traffic is refused`, async () => {
+		const asked: string[] = [];
+		const handle = makeProvider(
+			[agent({ mcpTransport: transport, env: { FAKE_IGNORE_CANCEL: "1", ...(transport === "http" ? { FAKE_MCP_HTTP: "1" } : {}) } })],
+			{
+				cancelGraceMs: 500,
+				permissionPolicy: async (request) => {
+					asked.push(request.title);
+					return { outcome: "selected", optionId: "allow" };
+				},
+			},
+		);
+		const messages: Message[] = [user("SLOW work")];
+		messages.push(await abortedStep(handle, messages), user("ECHO next"));
+		const next = await step(handle, messages);
+		assert.equal(next.stopReason, "stop");
+		const text = textOf(next);
+		assert.match(text, /^ECHO\[sess-2\]/, "the next prompt runs on a new session");
+		assert.match(text, /<conversation-history>[\s\S]*SLOW work[\s\S]*<\/conversation-history>/, "the new session is re-seeded");
+		assert.doesNotMatch(text, /STALE-CHUNK/);
+		assert.match(text, /STALE<<<permission=cancelled;mcp=rejected>>>/);
+		assert.deepEqual(asked, []);
+	});
+}
+
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_MCP_TITLE: "Run something" } })], { nativeTools: () => true });
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];

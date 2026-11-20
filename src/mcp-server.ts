@@ -1,8 +1,10 @@
 /**
  * MCP server that offers Pi's tools to ACP agents.
  *
- * One server per provider serves every agent; the agent id travels in the
- * HTTP path or the stdio relay's handshake, so calls reach that agent's turn.
+ * One server per provider serves every agent. Each ACP session gets its own
+ * revocable nonce, minted by `mint`; the agent id and the nonce travel in the
+ * HTTP path or the stdio relay's handshake, so a call names the session it
+ * came from, and a revoked session's calls are refused.
  * Tool lists are read live, so a changed Pi loadout is visible on the next
  * `tools/list`; stdio connections are also told with `list_changed`.
  *
@@ -46,6 +48,8 @@ export interface McpCallResult {
 
 export interface McpCall {
 	agentId: string;
+	/** The session nonce the call came in on; still minted (not revoked) when the call arrived. */
+	nonce: string;
 	name: string;
 	arguments: Record<string, unknown>;
 	/** Aborts when the agent cancels the request or disconnects. */
@@ -127,7 +131,10 @@ export class PiMcpServer {
 	private socketServer: NetServer | null = null;
 	private socketDir: string | null = null;
 	private socketPath = "";
-	private readonly sockets = new Map<Socket, string>();
+	/** Authenticated stdio connections, with the agent and session nonce they named. */
+	private readonly sockets = new Map<Socket, { agentId: string; nonce: string }>();
+	/** Minted session nonces, by nonce, with the agent each was minted for. */
+	private readonly nonces = new Map<string, string>();
 	private started: Promise<void> | null = null;
 
 	constructor(options: PiMcpServerOptions) {
@@ -140,13 +147,30 @@ export class PiMcpServer {
 		return this.started;
 	}
 
-	/** The `session/new` entry that connects `agentId` over `transport`. */
-	serverFor(agentId: string, transport: McpTransport): AcpMcpServer {
+	/** A new session nonce for `agentId`, valid until `revoke`. */
+	mint(agentId: string): string {
+		const nonce = randomBytes(16).toString("hex");
+		this.nonces.set(nonce, agentId);
+		return nonce;
+	}
+
+	/** Refuses the nonce from now on and closes the stdio connections that use it. */
+	revoke(nonce: string): void {
+		this.nonces.delete(nonce);
+		for (const [socket, owner] of this.sockets) {
+			if (owner.nonce !== nonce) continue;
+			this.sockets.delete(socket);
+			socket.destroy();
+		}
+	}
+
+	/** The `session/new` entry that connects `agentId`'s session `nonce` over `transport`. */
+	serverFor(agentId: string, transport: McpTransport, nonce: string): AcpMcpServer {
 		if (transport === "http") {
 			return {
 				type: "http",
 				name: PI_MCP_SERVER,
-				url: `http://127.0.0.1:${this.httpPort}/mcp/${encodeURIComponent(agentId)}`,
+				url: `http://127.0.0.1:${this.httpPort}/mcp/${encodeURIComponent(agentId)}/${nonce}`,
 				headers: [{ name: "Authorization", value: `Bearer ${this.token}` }],
 			};
 		}
@@ -158,6 +182,7 @@ export class PiMcpServer {
 			env: [
 				{ name: "PI_MCP_TOKEN", value: this.token },
 				{ name: "PI_MCP_AGENT", value: agentId },
+				{ name: "PI_MCP_SESSION", value: nonce },
 			],
 		};
 	}
@@ -165,7 +190,7 @@ export class PiMcpServer {
 	/** Tells `agentId`'s stdio connections that its tool list changed. */
 	notifyToolsChanged(agentId: string): void {
 		for (const [socket, owner] of this.sockets) {
-			if (owner === agentId) socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })}\n`);
+			if (owner.agentId === agentId) socket.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })}\n`);
 		}
 	}
 
@@ -175,6 +200,7 @@ export class PiMcpServer {
 		this.socketServer?.close();
 		for (const socket of this.sockets.keys()) socket.destroy();
 		this.sockets.clear();
+		this.nonces.clear();
 		if (this.socketDir) rmSync(this.socketDir, { recursive: true, force: true });
 		this.http = null;
 		this.socketServer = null;
@@ -183,7 +209,7 @@ export class PiMcpServer {
 	}
 
 	/** Answers one JSON-RPC message; null for notifications and responses. */
-	private async handle(message: unknown, agentId: string, inflight: Inflight): Promise<object | null> {
+	private async handle(message: unknown, agentId: string, nonce: string, inflight: Inflight): Promise<object | null> {
 		if (!isRecord(message) || typeof message.method !== "string") return null;
 		const { method } = message;
 		const id = typeof message.id === "string" || typeof message.id === "number" ? message.id : undefined;
@@ -215,7 +241,7 @@ export class PiMcpServer {
 				const controller = new AbortController();
 				inflight.set(id, controller);
 				try {
-					return rpcResult(id, await this.options.call({ agentId, name, arguments: args, signal: controller.signal }));
+					return rpcResult(id, await this.options.call({ agentId, nonce, name, arguments: args, signal: controller.signal }));
 				} catch (error) {
 					const text = error instanceof Error ? error.message : String(error);
 					return rpcResult(id, { content: [{ type: "text", text }], isError: true });
@@ -245,13 +271,15 @@ export class PiMcpServer {
 	}
 
 	private async serveHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
-		const match = /^\/mcp\/([^/?]+)/.exec(request.url ?? "");
-		if (!match?.[1]) return void response.writeHead(404).end();
+		const match = /^\/mcp\/([^/?]+)\/([^/?]+)/.exec(request.url ?? "");
+		if (!match?.[1] || !match[2]) return void response.writeHead(404).end();
 		if (request.headers.authorization !== `Bearer ${this.token}`) return void response.writeHead(401).end();
+		const agentId = decodeURIComponent(match[1]);
+		const nonce = match[2];
+		if (this.nonces.get(nonce) !== agentId) return void response.writeHead(403).end();
 		if (request.method === "DELETE") return void response.writeHead(200).end();
 		// No server-initiated stream: the spec allows 405 for GET.
 		if (request.method !== "POST") return void response.writeHead(405, { Allow: "POST, DELETE" }).end();
-		const agentId = decodeURIComponent(match[1]);
 		const chunks: Buffer[] = [];
 		for await (const chunk of request) chunks.push(chunk as Buffer);
 		let body: unknown;
@@ -266,7 +294,7 @@ export class PiMcpServer {
 			if (!response.writableFinished) for (const controller of inflight.values()) controller.abort();
 		});
 		const messages = Array.isArray(body) ? body : [body];
-		const replies = (await Promise.all(messages.map((message) => this.handle(message, agentId, inflight)))).filter(
+		const replies = (await Promise.all(messages.map((message) => this.handle(message, agentId, nonce, inflight)))).filter(
 			(reply): reply is object => reply !== null,
 		);
 		if (replies.length === 0) return void response.writeHead(202).end();
@@ -292,7 +320,7 @@ export class PiMcpServer {
 	}
 
 	private serveSocket(socket: Socket): void {
-		let agentId: string | null = null;
+		let owner: { agentId: string; nonce: string } | null = null;
 		const inflight: Inflight = new Map();
 		socket.on("error", (error) => this.options.log?.(`mcp socket error: ${error.message}`));
 		socket.on("close", () => {
@@ -310,18 +338,25 @@ export class PiMcpServer {
 			} catch {
 				return;
 			}
-			if (agentId === null) {
-				// The relay's first line authenticates and names the agent.
-				if (!isRecord(message) || message.token !== this.token || typeof message.agent !== "string") {
+			if (owner === null) {
+				// The relay's first line authenticates and names the agent and its session.
+				const hello = isRecord(message) ? message : {};
+				const { agent, session } = hello;
+				if (
+					hello.token !== this.token ||
+					typeof agent !== "string" ||
+					typeof session !== "string" ||
+					this.nonces.get(session) !== agent
+				) {
 					socket.destroy();
 					return;
 				}
-				agentId = message.agent;
-				this.sockets.set(socket, agentId);
+				owner = { agentId: agent, nonce: session };
+				this.sockets.set(socket, owner);
 				return;
 			}
-			const owner = agentId;
-			void this.handle(message, owner, inflight).then((reply) => {
+			if (!this.sockets.has(socket)) return;
+			void this.handle(message, owner.agentId, owner.nonce, inflight).then((reply) => {
 				if (reply && socket.writable) socket.write(`${JSON.stringify(reply)}\n`);
 			});
 		});

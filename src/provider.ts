@@ -200,6 +200,8 @@ export interface AcpProviderOptions {
 	 * prompt starts; it needs the mirror tool to be active. Otherwise tool activity is inline text.
 	 */
 	nativeTools?: () => boolean;
+	/** How long a cancelled prompt gets to answer before its ACP session is replaced (default 5 s). */
+	cancelGraceMs?: number;
 }
 
 export interface AcpProviderHandle {
@@ -465,6 +467,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/** The tools served to each agent, from the latest Pi context. */
 	const served = new Map<string, McpTool[]>();
 	let mcp: PiMcpServer | null = null;
+	/** The ACP session each bound MCP nonce belongs to; a call is accepted only for the live turn's session. */
+	const nonceSessions = new Map<string, { agentId: string; sessionId: string }>();
+	/** The MCP nonce minted for each `session/new` params object, until the session is bound or fails. */
+	const mintedNonces = new WeakMap<Record<string, unknown>, string>();
 	/** The ACP turn in progress; it spans several Pi messages. */
 	let live: LiveTurn | null = null;
 
@@ -495,19 +501,33 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return piToolRef(toolName, typeof toolCall.title === "string" ? toolCall.title : undefined) !== undefined;
 	}
 
-	const newClient = (agent: AcpAgentConfig, clientCwd: string): AcpClient =>
+	/** Forgets an ended session of `agent`'s main client and revokes its MCP nonces. */
+	function endSession(agent: AcpAgentConfig, sessionId: string): void {
+		sync.delete(sessionId);
+		for (const [nonce, owner] of nonceSessions) {
+			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
+			nonceSessions.delete(nonce);
+			mcp?.revoke(nonce);
+		}
+	}
+
+	const newClient = (agent: AcpAgentConfig, clientCwd: string, onSessionEnd?: (sessionId: string) => void): AcpClient =>
 		new AcpClient({
 			agent,
 			cwd: clientCwd,
 			handshakeTimeoutMs: options.config.handshakeTimeoutMs,
+			cancelGraceMs: options.cancelGraceMs,
 			onServerRequest: (request) => answerServerRequest(agent, request),
+			onSessionEnd,
 			log: log && ((message) => log(`${agent.id}: ${message}`)),
 		});
 
 	const getClient = (agent: AcpAgentConfig): AcpClient => {
 		let client = clients.get(agent.id);
 		if (!client) {
-			client = newClient(agent, cwd);
+			// WARN: only the main client reports ended sessions: session ids are unique per process at
+			// best, so an isolated client's ended session could share an id with a live main one.
+			client = newClient(agent, cwd, (sessionId) => endSession(agent, sessionId));
 			clients.set(agent.id, client);
 		}
 		return client;
@@ -548,7 +568,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				const piOnly = agent.piTools === "pi" && agent.ownToolsOffMeta !== undefined;
 				if (server && agent.piTools !== "off") {
 					const transport = agent.mcpTransport === "http" && info.capabilities.mcpHttp ? "http" : "stdio";
-					params.mcpServers = [server.serverFor(agent.id, transport)];
+					const nonce = server.mint(agent.id);
+					mintedNonces.set(params, nonce);
+					params.mcpServers = [server.serverFor(agent.id, transport, nonce)];
 				}
 				if (agent.systemPrompt === "session" && info.capabilities.systemPrompt && systemPrompt) {
 					params.systemPrompt = { mode: "append", content: [{ type: "text", text: systemPrompt }] };
@@ -560,6 +582,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 						: agent.sessionMeta;
 				if (meta && Object.keys(meta).length > 0) params._meta = meta;
 				return params;
+			},
+			settled: (params, sessionId) => {
+				const nonce = mintedNonces.get(params);
+				if (nonce === undefined) return;
+				mintedNonces.delete(params);
+				if (sessionId === undefined) server?.revoke(nonce);
+				else nonceSessions.set(nonce, { agentId: agent.id, sessionId });
 			},
 		};
 	}
@@ -883,7 +912,16 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/** An MCP `tools/call` from the agent: becomes a Pi tool call in the running turn. */
 	function handleMcpCall(call: McpCall): Promise<McpCallResult> {
 		const turn = live;
-		if (!turn || turn.agent.id !== call.agentId || !turn.accepting || turn.outcome || turn.controller.signal.aborted) {
+		const owner = nonceSessions.get(call.nonce);
+		if (
+			!turn ||
+			turn.agent.id !== call.agentId ||
+			owner?.agentId !== turn.agent.id ||
+			owner.sessionId !== turn.sessionId ||
+			!turn.accepting ||
+			turn.outcome ||
+			turn.controller.signal.aborted
+		) {
 			return Promise.reject(new Error("Pi is not running a turn for this agent, so its tools are unavailable."));
 		}
 		if (!(served.get(call.agentId) ?? []).some((tool) => tool.name === call.name)) {
@@ -1199,6 +1237,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			for (const client of clients.values()) client.dispose();
 			clients.clear();
 			sync.clear();
+			nonceSessions.clear();
 			mcp?.dispose();
 			mcp = null;
 		},

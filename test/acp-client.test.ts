@@ -119,6 +119,61 @@ test("abort sends session/cancel and keeps the session usable", async () => {
 	assert.equal(second.reply, "Hello world #0");
 });
 
+/** Starts a SLOW prompt on the current session and aborts it at its first update. */
+async function cancelSlowPrompt(client: AcpClient): Promise<string> {
+	const sessionId = await client.ensureSession();
+	const controller = new AbortController();
+	const result = await client.prompt({
+		sessionId,
+		payload: promptPayload(sessionId, "SLOW work"),
+		signal: controller.signal,
+		onUpdate: () => controller.abort(),
+	});
+	assert.deepEqual(result, { kind: "aborted" });
+	return sessionId;
+}
+
+test("a cancel that never drains moves the next prompt to a new session; a second one restarts the agent", async () => {
+	const ended: string[] = [];
+	const asked: string[] = [];
+	const client = makeClient({
+		agent: { env: { FAKE_IGNORE_CANCEL: "1" } },
+		cancelGraceMs: 200,
+		onSessionEnd: (sessionId) => ended.push(sessionId),
+		onServerRequest: async (request) => {
+			asked.push(String(request.sessionId));
+			return approveAll(request);
+		},
+	});
+	const firstPid = (await client.ensureReady()).name;
+	const first = await cancelSlowPrompt(client);
+	const second = await client.ensureSession();
+	assert.notEqual(second, first);
+	assert.equal(client.info?.name, firstPid, "one timeout keeps the process");
+	assert.deepEqual(ended, [first]);
+	const echo = await runPrompt(client, "ECHO two");
+	assert.equal(echo.result.kind, "finished");
+	assert.match(echo.reply, new RegExp(`^ECHO\\[${second}\\]<<<ECHO two>>> STALE<<<permission=cancelled;mcp=none>>>$`));
+	assert.deepEqual(asked, [], "the ended session's permission request never reaches the handler");
+
+	assert.equal(await cancelSlowPrompt(client), second);
+	await client.ensureSession();
+	assert.notEqual(client.info?.name, firstPid, "a second timeout in a row restarts the process");
+	assert.deepEqual(ended, [first, second]);
+	const after = await runPrompt(client, "ECHO three");
+	assert.equal(after.result.kind, "finished");
+});
+
+test("a new session that fails after a drain timeout restarts the agent", async () => {
+	const client = makeClient({ agent: { env: { FAKE_IGNORE_CANCEL: "1", FAKE_FAIL_SESSION_N: "2" } }, cancelGraceMs: 200 });
+	const firstPid = (await client.ensureReady()).name;
+	await cancelSlowPrompt(client);
+	await client.ensureSession();
+	assert.notEqual(client.info?.name, firstPid);
+	const { result } = await runPrompt(client, "ECHO again");
+	assert.equal(result.kind, "finished");
+});
+
 test("process crash rejects the prompt and the client respawns on next use", async () => {
 	const client = makeClient();
 	const firstInfo = await client.ensureReady();

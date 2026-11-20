@@ -37,6 +37,12 @@
  *   - FAKE_CANCEL_LAG=<ms>  after session/cancel, sends a chunk "LATE-CHUNK", a command list
  *                   with only "late", a permission request and an MCP echo call, waits <ms>, then answers `cancelled`; the next
  *                   ECHO adds "LAG<<<permission=<outcome>;mcp=<rejected|accepted:...|none>>>>"
+ *   - FAKE_IGNORE_CANCEL=1  never answers a cancelled prompt; on cancel it opens an MCP client to
+ *                   the session's server. When the next session/prompt arrives (on any session),
+ *                   each such lingering prompt sends, on its own session, a chunk "STALE-CHUNK", a
+ *                   permission request and an MCP echo call over that client; the next ECHO adds
+ *                   "STALE<<<permission=<outcome>;mcp=<rejected|accepted:...|pending|none>>>>"
+ *   - FAKE_FAIL_SESSION_N=<n>  the nth session/new of this process fails with an internal error
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
  *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
  *   - FAKE_STEERING=1    advertises and accepts `_session/steering`
@@ -96,6 +102,7 @@ const sessionExtras = () =>
 			: {};
 
 let sessionCounter = 0;
+let sessionNewCounter = 0;
 let promptCounter = 0;
 let serverRequestId = 0;
 const serverRequestWaiters = new Map();
@@ -217,6 +224,41 @@ async function lagThenCancel(turn) {
 	turn.finish("cancelled");
 }
 
+const IGNORE_CANCEL = process.env.FAKE_IGNORE_CANCEL === "1";
+/** FAKE_IGNORE_CANCEL: cancelled prompts never answered, with the MCP client each opened on cancel. */
+const lingering = [];
+/** What the lingering prompts' traffic got, reported by the next ECHO. */
+let staleReport = null;
+
+function linger(turn) {
+	const server = (sessionParams.get(turn.sessionId)?.mcpServers ?? []).find((entry) => entry.name === "pi");
+	lingering.push({ sessionId: turn.sessionId, mcp: server ? openMcp(server) : Promise.resolve(null) });
+}
+
+/** FAKE_IGNORE_CANCEL: old-session traffic, sent after the next prompt has arrived. */
+async function sendStaleTraffic() {
+	for (const { sessionId, mcp: opening } of lingering.splice(0)) {
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "STALE-CHUNK" } });
+		const response = await serverRequest("session/request_permission", {
+			sessionId,
+			toolCall: { toolCallId: "stale", title: "stale tool" },
+			options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+		});
+		const permission = response.result?.outcome?.outcome ?? "error";
+		const client = await opening;
+		let mcp = "none";
+		if (client) {
+			const call = await Promise.race([
+				client.request(CALL_ID, "tools/call", { name: "echo", arguments: { text: "stale" } }),
+				sleep(500).then(() => null),
+			]);
+			client.close();
+			mcp = call === null ? "pending" : call.error || call.result.isError ? "rejected" : `accepted:${callText(call)}`;
+		}
+		staleReport = `permission=${permission};mcp=${mcp}`;
+	}
+}
+
 function serverRequest(method, params) {
 	return new Promise((resolve) => {
 		const id = `srv-${++serverRequestId}`;
@@ -227,6 +269,7 @@ function serverRequest(method, params) {
 
 async function handlePrompt(message) {
 	const { sessionId } = message.params;
+	await sendStaleTraffic();
 	const text = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
 	const turn = {
 		sessionId,
@@ -264,7 +307,8 @@ async function handlePrompt(message) {
 	}
 	if (text.includes("ECHO")) {
 		const lag = lagReport === null ? "" : ` LAG<<<${lagReport}>>>`;
-		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>${lag}` } });
+		const stale = staleReport === null ? "" : ` STALE<<<${staleReport}>>>`;
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>${lag}${stale}` } });
 		promptCounter++;
 		return turn.finish("end_turn");
 	}
@@ -415,6 +459,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		case "session/new":
 			if (!authenticated) replyError(message.id, -32000, "Authentication required");
+			else if (++sessionNewCounter === Number(process.env.FAKE_FAIL_SESSION_N)) replyError(message.id, -32603, "fake session/new failure");
 			else {
 				const sessionId = `sess-${++sessionCounter}`;
 				sessionParams.set(sessionId, message.params);
@@ -465,7 +510,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			const running = activePrompts.get(message.params?.sessionId);
 			if (!running || running.finished) break;
 			running.cancelled = true;
-			if (CANCEL_LAG > 0) void lagThenCancel(running);
+			if (IGNORE_CANCEL) linger(running);
+			else if (CANCEL_LAG > 0) void lagThenCancel(running);
 			else running.finish("cancelled");
 			break;
 		}

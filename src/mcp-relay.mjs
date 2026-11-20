@@ -2,8 +2,8 @@
 /**
  * stdio MCP server process for ACP agents: pipes stdin and stdout to Pi's
  * MCP socket. The agent spawns it from the `session/new` entry; the socket
- * path is argv[2], and PI_MCP_TOKEN / PI_MCP_AGENT authenticate and route
- * the connection. Exits when either side closes.
+ * path is argv[2], and PI_MCP_TOKEN / PI_MCP_AGENT / PI_MCP_SESSION
+ * authenticate the connection and route it to one agent's ACP session. Exits when either side closes.
  */
 
 import { connect } from "node:net";
@@ -11,13 +11,14 @@ import { connect } from "node:net";
 const socketPath = process.argv[2];
 const token = process.env.PI_MCP_TOKEN;
 const agent = process.env.PI_MCP_AGENT;
-if (!socketPath || !token || !agent) {
-	process.stderr.write("mcp-relay: missing socket path, PI_MCP_TOKEN or PI_MCP_AGENT\n");
+const session = process.env.PI_MCP_SESSION;
+if (!socketPath || !token || !agent || !session) {
+	process.stderr.write("mcp-relay: missing socket path, PI_MCP_TOKEN, PI_MCP_AGENT or PI_MCP_SESSION\n");
 	process.exit(2);
 }
 
 const socket = connect(socketPath, () => {
-	socket.write(`${JSON.stringify({ token, agent })}\n`);
+	socket.write(`${JSON.stringify({ token, agent, session })}\n`);
 	process.stdin.pipe(socket);
 	socket.pipe(process.stdout);
 });
