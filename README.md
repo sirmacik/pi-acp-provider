@@ -75,6 +75,15 @@ option, Pi's thinking level (`shift+tab`, `--thinking`) is applied to it; levels
 the agent doesn't offer are hidden. Discovery never triggers `authMethod`
 sign-in; that waits for the first prompt.
 
+Each model's context window starts at 128K. Once the agent reports its real
+window (`size` in an ACP `usage_update`) during a turn, the next model list
+refresh publishes that value for the model that ran the turn, and it is saved
+with the list. A `contextWindow` in a `~/.pi/agent/models.json`
+`modelOverrides` entry (for example
+`{ "providers": { "acp": { "modelOverrides": { "claude": { "contextWindow": 1000000 } } } } }`
+for `acp/claude`) always wins over both, since Pi applies it on top of the
+provider's list.
+
 ### Agent slash commands
 
 Each agent registers a Pi command named after its key. `/<key> <command>`
@@ -204,6 +213,11 @@ Global keys:
 - No ACP client capabilities (`fs`, `terminal`) are offered, so agents use
   their own file and terminal tools. Other agent→client requests get
   method-not-found.
+- A context window the agent reports does not change the running Pi
+  session: Pi reads the window from the selected model, which it replaces
+  only when a model is selected or the provider is registered. The reported
+  window applies after the next model list refresh (opening `/model`, or the
+  next startup), once the model is selected again or Pi reloads.
 - Of Pi's stream hooks, `onPayload` and `onProviderStreamEvent` are honored.
   `onResponse` is HTTP-specific and not called.
 

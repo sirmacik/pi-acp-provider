@@ -141,6 +141,62 @@ for (const [label, options] of [
 	});
 }
 
+async function refreshOffline(handle: AcpProviderHandle, stored?: Model<Api>[]): Promise<Model<Api>[]> {
+	let published: Model<Api>[] = [];
+	await handle.provider.refreshModels?.({
+		allowNetwork: false,
+		signal: new AbortController().signal,
+		...(stored ? { stored: { models: stored, checkedAt: 0 } } : {}),
+		publish: async ({ persist, update }) => {
+			published = (persist?.models ?? []) as Model<Api>[];
+			update?.();
+			return true;
+		},
+	});
+	return published;
+}
+
+for (const [label, options] of [
+	["a live turn", {}],
+	["an isolated request", { cacheRetention: "none" }],
+] as const) {
+	test(`the refreshed catalogue takes the window the agent reported (${label})`, async () => {
+		const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+		const model = firstModel(handle);
+		assert.equal(model.contextWindow, 128_000);
+		const last = (await collect(handle.provider.streamSimple(model, userContext("USAGE please"), options))).at(-1);
+		assert.ok(last?.type === "done");
+		const published = await refreshOffline(handle);
+		assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 200_000], ["other", 128_000]]);
+		assert.deepEqual(handle.provider.getModels().map((entry) => entry.contextWindow), [200_000, 128_000]);
+	});
+}
+
+test("a window reported for one of the agent's models applies to that model only", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config" } })]);
+	await handle.provider.refreshModels?.({ allowNetwork: true, signal: new AbortController().signal, publish: async ({ update }) => (update?.(), true) });
+	const smart = handle.provider.getModels().find((entry) => entry.id === "fake/smart");
+	assert.ok(smart);
+	assert.ok((await lastEvent(handle, "USAGE please", smart))?.type === "done");
+	const published = await refreshOffline(handle);
+	assert.deepEqual(
+		published.map((entry) => [entry.id, entry.contextWindow]),
+		[["fake", 128_000], ["fake/fast", 128_000], ["fake/smart", 200_000]],
+	);
+});
+
+test("a persisted reported window survives rediscovery", async () => {
+	const handle = makeProvider();
+	const stored = handle.provider.getModels().map((entry) => ({ ...entry, contextWindow: 200_000 }));
+	await handle.provider.refreshModels?.({
+		allowNetwork: true,
+		signal: new AbortController().signal,
+		stored: { models: stored, checkedAt: 0 },
+		publish: async ({ update }) => (update?.(), true),
+	});
+	assert.equal(firstModel(handle).contextWindow, 200_000);
+});
+
 test("without usage_update the turn's summed usage is reported unchanged", async () => {
 	const handle = makeProvider();
 	const last = await lastEvent(handle, "LONGLOOP NOUPDATE please");
