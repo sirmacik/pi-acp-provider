@@ -106,7 +106,7 @@ Per-agent keys:
 | `mcpTransport` | no | `stdio` or `http` for Pi's MCP server. `http` falls back to stdio when the agent does not advertise it. |
 | `systemPrompt` | no | `prompt` (in front of the first prompt), `session` (ACP `systemPrompt` on `session/new`; falls back to `prompt`), or `off`. |
 | `sessionMeta` | no | Extra `_meta` for `session/new`, merged over the preset. |
-| `ownToolsOffMeta` | no | `_meta` that turns off the agent's own tools, merged in only with `piTools: "pi"`. |
+| `ownToolsOffMeta` | no | `_meta` that turns off the agent's own tools. Live sessions merge it in only with `piTools: "pi"`; isolated requests (summaries) always send it, merged over `sessionMeta`, whatever `piTools` says. |
 
 #### Defaults and presets
 
@@ -167,8 +167,9 @@ Global keys:
   "none"`) run in a separate, throwaway agent process, so the live session
   is not touched. They get no Pi tools, and when the agent has
   `ownToolsOffMeta` (the `claude-agent-acp` preset) it is sent on that
-  session whatever `piTools` says, so the summary cannot run the agent's own
-  tools either. Cache-warming requests are answered without contacting the
+  session, merged over `sessionMeta`, whatever `piTools` says, so the summary
+  cannot run the agent's own tools either. Agents without it get no `_meta`
+  on that session, not even `sessionMeta`. Cache-warming requests are answered without contacting the
   agent.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
   maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other

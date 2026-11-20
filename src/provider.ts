@@ -580,15 +580,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/**
 	 * `session/new` params for an isolated request: no Pi tools, and the agent's own tools off whenever it has
 	 * a switch for them, whatever `piTools` says, because a summary needs no tools (adr-002: fail closed).
-	 * WARN: agents without `ownToolsOffMeta` (Codex) keep their built-in tools here; ACP has no generic switch.
+	 * WARN: agents without `ownToolsOffMeta` (Codex) get the bare params isolated sessions always had, without
+	 * `sessionMeta`, and keep their built-in tools; ACP has no generic switch.
 	 */
 	function isolatedSetup(agent: AcpAgentConfig): SessionSetup {
 		return {
 			key: "isolated",
-			params: () => {
-				const meta = agent.ownToolsOffMeta ? deepMerge(agent.sessionMeta ?? {}, agent.ownToolsOffMeta) : agent.sessionMeta;
-				return meta && Object.keys(meta).length > 0 ? { _meta: meta } : {};
-			},
+			params: () => (agent.ownToolsOffMeta ? { _meta: deepMerge(agent.sessionMeta ?? {}, agent.ownToolsOffMeta) } : {}),
 		};
 	}
 

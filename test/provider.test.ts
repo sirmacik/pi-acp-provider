@@ -236,7 +236,9 @@ test("an isolated request runs with the agent's own tools off when its preset ca
 test("an isolated request keeps the session params of an agent without a tools switch", async () => {
 	const codex = AGENT_PRESETS["codex-acp"];
 	assert.ok(codex && codex.ownToolsOffMeta === undefined);
-	const params = await isolatedSessionParams(fakeAgent({ piTools: codex.piTools ?? "both", ownToolsOffMeta: codex.ownToolsOffMeta }));
+	const params = await isolatedSessionParams(
+		fakeAgent({ piTools: codex.piTools ?? "both", sessionMeta: { vendor: { option: true } }, ownToolsOffMeta: codex.ownToolsOffMeta }),
+	);
 	assert.deepEqual(params.mcpServers, []);
 	assert.equal(params._meta, undefined);
 });
