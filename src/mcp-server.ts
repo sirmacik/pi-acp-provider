@@ -25,7 +25,6 @@ import { createServer as createHttpServer, type IncomingMessage, type Server as 
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { isRecord } from "./acp.ts";
 import { PI_MCP_SERVER, type McpTransport } from "./config.ts";
@@ -159,6 +158,32 @@ function readBody(request: IncomingMessage, limit: number): Promise<Buffer | nul
 		};
 		const onClose = () => onError(new Error("aborted"));
 		request.on("data", onData).on("end", onEnd).on("error", onError).on("close", onClose);
+	});
+}
+
+/**
+ * Calls `onLine` for each newline-terminated line of `socket`, in order and synchronously, so a line can change
+ * the limit of the next. Destroys the socket once a line, complete or not, exceeds `limit()` bytes; an oversized
+ * line is never decoded or parsed.
+ */
+function readLines(socket: Socket, limit: () => number, onLine: (line: string) => void): void {
+	let pending: Buffer[] = [];
+	let pendingBytes = 0;
+	socket.on("data", (chunk: Buffer) => {
+		let start = 0;
+		while (!socket.destroyed) {
+			const newline = chunk.indexOf(0x0a, start);
+			const end = newline === -1 ? chunk.length : newline;
+			pendingBytes += end - start;
+			if (pendingBytes > limit()) return void socket.destroy();
+			pending.push(chunk.subarray(start, end));
+			if (newline === -1) return;
+			const line = Buffer.concat(pending).toString("utf8");
+			pending = [];
+			pendingBytes = 0;
+			start = newline + 1;
+			onLine(line);
+		}
 	});
 }
 
@@ -481,18 +506,8 @@ export class PiMcpServer {
 			this.sockets.delete(socket);
 			for (const controller of inflight.values()) controller.abort();
 		});
-		// WHY: readline buffers a line until its newline arrives, so an endless line would grow without bound.
-		let lineBytes = 0;
-		socket.on("data", (chunk: Buffer) => {
-			const newline = chunk.lastIndexOf(0x0a);
-			lineBytes = newline === -1 ? lineBytes + chunk.length : chunk.length - newline - 1;
-			if (lineBytes > (owner === null ? MAX_HELLO_BYTES : this.maxRequestBytes)) socket.destroy();
-		});
-		const lines = createInterface({ input: socket });
-		// WARN: readline re-emits the socket's errors; without a listener a relay that went away
-		// (EPIPE, ECONNRESET) throws in Pi's process. The socket's own handler already logs them.
-		lines.on("error", () => {});
-		lines.on("line", (line) => {
+		// WHY: the limit is read per line, so a request sent in the same chunk as the handshake gets the post-handshake limit.
+		readLines(socket, () => (owner === null ? MAX_HELLO_BYTES : this.maxRequestBytes), (line) => {
 			let message: unknown;
 			try {
 				message = JSON.parse(line);

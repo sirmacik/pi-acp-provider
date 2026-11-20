@@ -99,35 +99,72 @@ test("http MCP refuses an oversized body only after authentication", async () =>
 	assert.equal(reply.status, 401);
 });
 
+/** The relay handshake of `agentId`'s session `nonce`, as the relay would send it. */
+function helloFor(server: PiMcpServer, agentId: string, nonce: string) {
+	const entry = server.serverFor(agentId, "stdio", nonce);
+	assert.ok("env" in entry);
+	const env = Object.fromEntries(entry.env.map((variable) => [variable.name, variable.value]));
+	return { token: env.PI_MCP_TOKEN, agent: env.PI_MCP_AGENT, session: env.PI_MCP_SESSION };
+}
+
+/** Writes each of `writes` to the relay socket, 20 ms apart; reports whether the server closed the connection within 300 ms, and its replies. */
+async function rawRelay(server: PiMcpServer, writes: string[]) {
+	const entry = server.serverFor("a", "stdio", "unused");
+	assert.ok("args" in entry);
+	const socket = connect(entry.args[1]!);
+	await once(socket, "connect");
+	socket.on("error", () => {});
+	const replies: Record<string, any>[] = [];
+	createInterface({ input: socket }).on("line", (reply) => replies.push(JSON.parse(reply))).on("error", () => {});
+	const closed = once(socket, "close").then(() => true);
+	for (const data of writes) {
+		socket.write(data);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	const wasClosed = await Promise.race([closed, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300))]);
+	socket.destroy();
+	return { closed: wasClosed, replies };
+}
+
+const line = (message: unknown) => `${JSON.stringify(message)}\n`;
+const paddedList = (bytes: number) => ({ ...listTools, params: { pad: "x".repeat(bytes) } });
+
 test("stdio MCP refuses another agent's token and closes an oversized handshake line", async () => {
 	const server = await startServer([], { maxRequestBytes: 1024 });
 	const nonce = server.mint("a");
-	const entry = server.serverFor("a", "stdio", nonce);
-	const otherEntry = server.serverFor("b", "stdio", server.mint("b"));
-	assert.ok("args" in entry && "args" in otherEntry);
-	const envOf = (value: typeof entry) => Object.fromEntries(("env" in value ? value.env : []).map((variable) => [variable.name, variable.value]));
-	/** Sends `data` and reports whether the server closed the connection within 300 ms, and what it answered. */
-	const handshake = async (data: string) => {
-		const socket = connect(entry.args[1]!);
-		await once(socket, "connect");
-		socket.on("error", () => {});
-		const replies: string[] = [];
-		createInterface({ input: socket }).on("line", (reply) => replies.push(reply)).on("error", () => {});
-		const closed = once(socket, "close").then(() => true);
-		socket.write(data);
-		const wasClosed = await Promise.race([closed, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300))]);
-		socket.destroy();
-		return { closed: wasClosed, replies };
-	};
-	const withCall = (hello: object) => `${JSON.stringify(hello)}\n${JSON.stringify(listTools)}\n`;
-	const foreign = await handshake(withCall({ token: envOf(otherEntry).PI_MCP_TOKEN, agent: "a", session: nonce }));
+	const otherHello = helloFor(server, "b", server.mint("b"));
+	const handshake = (data: string) => rawRelay(server, [data]);
+	const withCall = (hello: object) => line(hello) + line(listTools);
+	const foreign = await handshake(withCall({ token: otherHello.token, agent: "a", session: nonce }));
 	assert.equal(foreign.closed, true, "another agent's token");
 	assert.deepEqual(foreign.replies, []);
 	const huge = await handshake(`{"token":"${"x".repeat(8192)}`);
 	assert.equal(huge.closed, true, "an unterminated handshake line over the cap");
-	const good = await handshake(withCall({ token: envOf(entry).PI_MCP_TOKEN, agent: "a", session: nonce }));
+	const good = await handshake(withCall(helloFor(server, "a", nonce)));
 	assert.equal(good.replies.length, 1, "the session's own token");
 	assert.equal(good.closed, false);
+});
+
+test("stdio MCP applies the request limit, not the handshake limit, to a request coalesced with the handshake", async () => {
+	const server = await startServer([], { maxRequestBytes: 16 * 1024 });
+	const hello = helloFor(server, "a", server.mint("a"));
+	const request = JSON.stringify(paddedList(8 * 1024));
+	const reply = await rawRelay(server, [line(hello) + request.slice(0, -10), `${request.slice(-10)}\n`]);
+	assert.equal(reply.closed, false);
+	assert.equal(reply.replies.length, 1);
+	assert.ok(reply.replies[0]?.result, "the request over the handshake limit is answered");
+});
+
+test("stdio MCP closes the connection on a completed line over the cap without answering it", async () => {
+	const server = await startServer([], { maxRequestBytes: 1024 });
+	const hello = helloFor(server, "a", server.mint("a"));
+	const inOneChunk = await rawRelay(server, [line(hello) + line(paddedList(4096))]);
+	assert.equal(inOneChunk.closed, true, "a line that ends in the chunk it started in");
+	assert.deepEqual(inOneChunk.replies, []);
+	const big = line(paddedList(4096));
+	const acrossChunks = await rawRelay(server, [line(hello), big.slice(0, 900), big.slice(900)]);
+	assert.equal(acrossChunks.closed, true, "a line whose newline arrives in a later chunk");
+	assert.deepEqual(acrossChunks.replies, []);
 });
 
 test("http MCP refuses a request whose nonce was revoked while its body uploaded", async () => {
