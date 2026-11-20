@@ -330,7 +330,6 @@ interface PiCall {
 
 interface LiveTurn {
 	agent: AcpAgentConfig;
-	/** The Pi model id the turn runs as. */
 	modelId: string;
 	acp: AcpClient;
 	sessionId: string;
@@ -1169,13 +1168,14 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		for (const model of context.stored?.models ?? []) {
 			const owner = parseModelId(model.id, agents)?.agent.id;
 			if (!owner) continue;
-			const window = "contextWindow" in model ? model.contextWindow : undefined;
+			const stored: unknown = "contextWindow" in model ? model.contextWindow : undefined;
+			const window = typeof stored === "number" && Number.isSafeInteger(stored) && stored > 0 ? stored : DEFAULT_CONTEXT_WINDOW;
 			// WHY: the persisted catalogue holds only windows this provider published, so a non-default one was
 			// reported by the agent earlier and must survive the rediscovery below, which starts from the default.
-			if (window !== undefined && window !== DEFAULT_CONTEXT_WINDOW && !reportedWindows.has(model.id)) reportedWindows.set(model.id, window);
+			if (window !== DEFAULT_CONTEXT_WINDOW && !reportedWindows.has(model.id)) reportedWindows.set(model.id, window);
 			if (discovered.has(owner)) continue;
 			const list = restored.get(owner) ?? [];
-			list.push(model as Model<Api>);
+			list.push({ ...(model as Model<Api>), contextWindow: window });
 			restored.set(owner, list);
 		}
 		for (const [owner, list] of restored) discovered.set(owner, list);

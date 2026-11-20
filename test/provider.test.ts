@@ -197,6 +197,23 @@ test("a persisted reported window survives rediscovery", async () => {
 	assert.equal(firstModel(handle).contextWindow, 200_000);
 });
 
+for (const size of ["1e999", "0", "-5", "12.5", '"200000"', "null"]) {
+	test(`a reported size of ${size} keeps the configured window`, async () => {
+		const handle = makeProvider([fakeAgent({ env: { FAKE_USAGE_SIZE: size } })]);
+		assert.ok((await lastEvent(handle, "USAGE please"))?.type === "done");
+		const published = await refreshOffline(handle);
+		assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 128_000]]);
+		assert.equal(JSON.parse(JSON.stringify(published))[0].contextWindow, 128_000);
+	});
+}
+
+test("a persisted window that is not a positive integer is not restored", async () => {
+	const handle = makeProvider();
+	const stored = handle.provider.getModels().map((entry) => ({ ...entry, contextWindow: null as unknown as number }));
+	const published = await refreshOffline(handle, stored);
+	assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 128_000]]);
+});
+
 async function isolatedSessionParams(agent: AcpAgentConfig) {
 	const handle = makeProvider([agent]);
 	const last = (await collect(handle.provider.streamSimple(firstModel(handle), userContext("SESSIONINFO"), { cacheRetention: "none" }))).at(-1);
