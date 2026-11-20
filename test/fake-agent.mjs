@@ -32,7 +32,8 @@
  *   - "MCPCALL:<tool>:<json args>"  reports a tool call titled "mcp__pi__<tool>",
  *                   calls <tool> on the session's MCP server (stdio or http),
  *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
- *                   when a _session/steering message arrived meanwhile)
+ *                   when a _session/steering message arrived meanwhile); result
+ *                   items are joined with "|", non-text ones as "[<type>:<mimeType>]"
  *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
  *   - FAKE_MCP_CANCEL=1  cancels that MCP call after 50ms (`notifications/cancelled`) and ends the
  *                   turn with "AGENT-WENT-ON CALL<<<what the call returned>>>"
@@ -50,6 +51,8 @@
  *                   numeric one, and replies "BADPERM<<<missing=<outcome>;number=<outcome>>>>"
  *   - FAKE_FAIL_SESSION_N=<n>  the nth session/new of this process fails with an internal error,
  *                   after FAKE_FAIL_SESSION_DELAY=<ms> (default 0)
+ *   - FAKE_FAIL_PROMPT_N=<n>[,<n>...]  the nth session/prompt of this process (counting every
+ *                   prompt, on any session) gets a one-shot internal RPC error instead of running
  *   - FAKE_ORPHAN=<file>  at start, spawns a child in the agent's process group that ignores
  *                   SIGTERM and writes its pid to <file> (POSIX only)
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
@@ -118,6 +121,9 @@ const sessionExtras = () =>
 let sessionCounter = 0;
 let sessionNewCounter = 0;
 let promptCounter = 0;
+/** session/prompt requests this process received, for FAKE_FAIL_PROMPT_N. */
+let promptRequests = 0;
+const FAIL_PROMPTS = new Set((process.env.FAKE_FAIL_PROMPT_N ?? "").split(",").filter(Boolean).map(Number));
 let serverRequestId = 0;
 const serverRequestWaiters = new Map();
 /** The running prompt of each session. */
@@ -211,7 +217,9 @@ async function startMcpCall(server, name, args) {
 const callText = (response) =>
 	response.error
 		? `error:${response.error.message}`
-		: (response.result.content ?? []).map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("|");
+		: (response.result.content ?? [])
+				.map((block) => (block.type === "text" ? block.text : `[${block.type}${block.mimeType ? `:${block.mimeType}` : ""}]`))
+				.join("|");
 
 const CANCEL_LAG = Number(process.env.FAKE_CANCEL_LAG ?? 0);
 
@@ -529,7 +537,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			}
 			break;
 		case "session/prompt":
-			void handlePrompt(message);
+			if (FAIL_PROMPTS.has(++promptRequests)) replyError(message.id, -32603, `fake one-shot rejection of prompt #${promptRequests}`);
+			else void handlePrompt(message);
 			break;
 		case "_session/steering": {
 			if (process.env.FAKE_STEERING !== "1") {
