@@ -539,15 +539,40 @@ test("a fork that drops an aborted latest reply and its user starts a new sessio
 	assert.doesNotMatch(forked.prompt, /SLOW two/);
 });
 
-test("a context edit that drops a user the session got before its latest reply starts a new session", async () => {
+test("a context edit that drops a user a later request still held starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	messages.push(await step(handle, messages), user("ECHO two"));
+	messages.push(await step(handle, messages), user("ECHO three"));
+	const third = await step(handle, messages);
+	assert.equal(sessionOf(third), "sess-1");
+	const edited = await capture(handle, [...messages.filter((message) => message !== messages[2]), third, user("ECHO four")]);
+	assert.equal(edited.message.stopReason, "stop");
+	assert.notEqual(sessionOf(edited.message), "sess-1");
+});
+
+test("a context edit that drops a foreign reply from an accepted seed starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const other = foreignReply("answer from another model");
+	const messages: Message[] = [user("earlier question"), other, user("ECHO two")];
+	const second = await step(handle, messages);
+	assert.match(textOf(second), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*answer from another model/);
+	const edited = await capture(handle, [messages[0]!, messages[2]!, second, user("ECHO three")]);
+	assert.equal(edited.message.stopReason, "stop");
+	assert.notEqual(sessionOf(edited.message), "sess-1");
+	assert.match(edited.prompt, /^<conversation-history>\n[^\n]*\n\n\[user\]\nearlier question\n\n\[user\]\nECHO two\n\n\[assistant\]\nECHO\[sess-1\]/, "the seed goes from the first user straight to the next one");
+});
+
+test("user messages a context handler adds for one request only do not start a new session", async () => {
 	const handle = makeProvider([agent()]);
 	const messages: Message[] = [user("ECHO one")];
 	const first = await step(handle, messages);
 	messages.push(first, user("ECHO two"));
-	const second = await step(handle, messages);
-	const edited = await capture(handle, [...messages.slice(0, 2), second, user("ECHO three")]);
-	assert.equal(edited.message.stopReason, "stop");
-	assert.notEqual(sessionOf(edited.message), sessionOf(first));
+	const injected = await step(handle, [messages[0]!, user("one-shot note in history"), first, messages[2]!, user("one-shot note after")]);
+	assert.match(textOf(injected), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*one-shot note in history[\s\S]*ECHO twoone-shot note after>>>$/);
+	messages.push(injected, user("ECHO three"));
+	const next = textOf(await step(handle, messages));
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO three>>>$/);
 });
 
 test("compaction, which replaces the first message, starts a new session", async () => {

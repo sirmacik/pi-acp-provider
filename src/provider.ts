@@ -491,11 +491,17 @@ interface SyncState {
 	 */
 	seeded: Set<string>;
 	/**
-	 * The newest reply the session streamed to an end Pi keeps in context, and the users delivered by then.
-	 * Unlike `anchor`, it covers the latest reply, so a fork that keeps an earlier one is still seen.
+	 * Timestamp of the newest reply the session streamed to an end Pi keeps in context. Unlike `anchor`,
+	 * it covers the latest reply, so a fork that keeps an earlier one is still seen.
 	 * WHY: `error` replies are left out because Pi omits a retried one from context; `aborted` ones it keeps.
 	 */
-	lastStreamed: { timestamp: number; users: readonly string[] } | undefined;
+	lastStreamed: number | undefined;
+	/**
+	 * Keys of accepted history Pi's history must still hold: seeded replies and tool results at once, and
+	 * user messages (delivered or seeded) once a later request still holds them.
+	 * WHY: a Pi `context` handler may add a user message for one request only; it must not count as removed.
+	 */
+	kept: Set<string>;
 	/** The Pi system prompt the session last received. */
 	systemPrompt: string;
 }
@@ -969,9 +975,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				delivered: new Set(),
 				seeded: new Set(),
 				lastStreamed: undefined,
+				kept: new Set(),
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
 			sync.set(sessionId, state);
+			keepConfirmed(state, messages);
 			info = acp.info ?? (await acp.ensureReady(signal));
 			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions);
 		} catch (error) {
@@ -1006,7 +1014,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				promptPart(
 					[tagged("conversation-history", transcript, intro)],
 					() => {
-						for (const seen of unseen) state.seeded.add(messageKey(seen));
+						for (const seen of unseen) {
+							state.seeded.add(messageKey(seen));
+							if (seen.role !== "user") state.kept.add(messageKey(seen));
+						}
 					},
 					// WHY: the anchor must stay before history the session never got, or later prompts skip it.
 					{ omit: () => (heldHistory = history.indexOf(unseen[0]!)) },
@@ -1092,26 +1103,33 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/**
 	 * Whether Pi's history no longer holds what the session saw: the first message
-	 * changed (compaction), or a tree jump or fork dropped the session's latest
-	 * reply, a user delivered before it, or the anchor. Messages an extension adds
-	 * for one request only do not count, since they are never the session's replies.
+	 * changed (compaction), or a tree jump, fork or context edit dropped the
+	 * session's latest reply, the anchor, or accepted history in `kept`. Messages an
+	 * extension adds for one request only do not count.
 	 */
 	function diverged(state: SyncState, messages: readonly Message[]): boolean {
 		if (state.first !== undefined && messages[0] && messageKey(messages[0]) !== state.first) return true;
 		const hasReply = (timestamp: number): boolean =>
 			messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === timestamp);
 		if (state.anchor !== undefined && !hasReply(state.anchor)) return true;
-		if (state.lastStreamed === undefined) return false;
-		if (!hasReply(state.lastStreamed.timestamp)) return true;
+		if (state.lastStreamed !== undefined && !hasReply(state.lastStreamed)) return true;
 		const keys = new Set(messages.map(messageKey));
-		return state.lastStreamed.users.some((key) => !keys.has(key));
+		return [...state.kept].some((key) => !keys.has(key));
+	}
+
+	/** Adds to `kept` the users an earlier request delivered or seeded that Pi's history still holds. */
+	function keepConfirmed(state: SyncState, messages: readonly Message[]): void {
+		for (const message of messages) {
+			const key = messageKey(message);
+			if (message.role === "user" && (state.delivered.has(key) || state.seeded.has(key))) state.kept.add(key);
+		}
 	}
 
 	/** Records the turn's settled Pi message as the session's latest reply, if Pi keeps it in context. */
 	function noteStreamed(turn: LiveTurn, message: AssistantMessage): void {
 		const state = sync.get(turn.sessionId);
 		if (!state?.ownStamps.has(message.timestamp) || message.stopReason === "error") return;
-		state.lastStreamed = { timestamp: message.timestamp, users: [...state.delivered] };
+		state.lastStreamed = message.timestamp;
 	}
 
 	/** Whether the messages Pi added answer tool calls of `turn`, so the same ACP turn goes on. */
