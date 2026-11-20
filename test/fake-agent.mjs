@@ -4,6 +4,8 @@
  * Behavior is driven by markers in the prompt text and FAKE_* env vars:
  *   - "PERMISSION"  asks session/request_permission (string request id) first
  *   - "SLOW"        delays each streamed update (~150ms)
+ *                   (a PERMISSION answer that arrives after session/cancel is reported by the next
+ *                   ECHO as "CANCELLEDPERM<<<<optionId|outcome>>>>")
  *   - "CRASH"       exits (code 3) mid-stream after the tool update
  *   - "AUTH"        fails the prompt with the ACP auth_required error (-32000)
  *   - "RPCERROR"    fails the prompt with an internal error
@@ -121,6 +123,8 @@ const serverRequestWaiters = new Map();
 const activePrompts = new Map();
 /** What the fake saw of a cancelled turn's late traffic (FAKE_CANCEL_LAG), reported by the next ECHO. */
 let lagReport = null;
+/** The answer a PERMISSION prompt got after it was cancelled, reported by the next ECHO. */
+let cancelledPermission = null;
 const sessionParams = new Map();
 const steered = [];
 
@@ -319,7 +323,7 @@ async function handlePrompt(message) {
 	}
 	if (text.includes("ECHO")) {
 		const lag = lagReport === null ? "" : ` LAG<<<${lagReport}>>>`;
-		const stale = staleReport === null ? "" : ` STALE<<<${staleReport}>>>`;
+		const stale = `${staleReport === null ? "" : ` STALE<<<${staleReport}>>>`}${cancelledPermission === null ? "" : ` CANCELLEDPERM<<<${cancelledPermission}>>>`}`;
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>${lag}${stale}` } });
 		promptCounter++;
 		return turn.finish("end_turn");
@@ -395,6 +399,7 @@ async function handlePrompt(message) {
 		});
 		const outcome = response.result?.outcome ?? {};
 		approved = outcome.outcome === "selected" ? outcome.optionId : outcome.outcome ?? "error";
+		if (turn.cancelled) cancelledPermission = approved;
 		if (turn.finished || turn.cancelled) return;
 	}
 

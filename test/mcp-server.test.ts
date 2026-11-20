@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { request as httpRequest, type IncomingMessage } from "node:http";
 import { connect } from "node:net";
 import { createInterface } from "node:readline";
 import { PiMcpServer, type McpCall } from "../src/mcp-server.ts";
@@ -47,6 +48,26 @@ test("http MCP answers only a minted, unrevoked nonce of the agent in the path",
 	assert.equal(await post(entry.url.replace(`/${nonce}`, ""), token), 404, "no nonce");
 	server.revoke(nonce);
 	assert.equal(await post(entry.url, token), 403, "a revoked nonce");
+});
+
+test("http MCP refuses a request whose nonce was revoked while its body uploaded", async () => {
+	const server = await startServer();
+	const nonce = server.mint("a");
+	const entry = server.serverFor("a", "http", nonce);
+	assert.ok("url" in entry);
+	const body = JSON.stringify(listTools);
+	const request = httpRequest(entry.url, {
+		method: "POST",
+		headers: { ...Object.fromEntries(entry.headers.map((header) => [header.name, header.value])), "content-type": "application/json" },
+	});
+	const responded = once(request, "response") as Promise<[IncomingMessage]>;
+	request.write(body.slice(0, 5));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	server.revoke(nonce);
+	request.end(body.slice(5));
+	const [response] = await responded;
+	response.resume();
+	assert.equal(response.statusCode, 403);
 });
 
 /** Opens a raw stdio-relay connection and sends its handshake; resolves once the server answered or closed. */

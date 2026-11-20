@@ -282,6 +282,8 @@ export class PiMcpServer {
 		if (request.method !== "POST") return void response.writeHead(405, { Allow: "POST, DELETE" }).end();
 		const chunks: Buffer[] = [];
 		for await (const chunk of request) chunks.push(chunk as Buffer);
+		// WHY: the session may have been revoked while the body was uploading.
+		if (this.nonces.get(nonce) !== agentId) return void response.writeHead(403).end();
 		let body: unknown;
 		try {
 			body = JSON.parse(Buffer.concat(chunks).toString("utf8"));

@@ -223,6 +223,70 @@ test("ending a session while its cancel drains rejects the cancelled prompt", as
 	assert.equal(result.kind, "finished");
 });
 
+/** A server-request handler that holds each request until the test answers it. */
+function heldHandler() {
+	const held: ((optionId: string) => void)[] = [];
+	const arrived: (() => void)[] = [];
+	const handler: ServerRequestHandler = () =>
+		new Promise((resolve) => {
+			held.push((optionId) => resolve({ outcome: { outcome: "selected", optionId } }));
+			arrived.shift()?.();
+		});
+	const next = async (): Promise<(optionId: string) => void> => {
+		while (held.length === 0) await new Promise<void>((resolve) => arrived.push(resolve));
+		return held.shift()!;
+	};
+	return { handler, next };
+}
+
+/** Starts a PERMISSION prompt that ignores its cancel, waits for its request to be held, then aborts it. */
+async function cancelWhileAsking(client: AcpClient, next: () => Promise<(optionId: string) => void>) {
+	const sessionId = await client.ensureSession();
+	const controller = new AbortController();
+	const prompt = client.prompt({
+		sessionId,
+		payload: promptPayload(sessionId, "PERMISSION IGNORE-CANCEL"),
+		signal: controller.signal,
+		onUpdate: () => {},
+	});
+	const answer = await next();
+	controller.abort();
+	assert.deepEqual(await prompt, { kind: "aborted" });
+	return answer;
+}
+
+test("a permission answer for a session that ended meanwhile goes back as cancelled", async () => {
+	const { handler, next } = heldHandler();
+	const client = makeClient({ cancelGraceMs: 200, onServerRequest: handler });
+	const answer = await cancelWhileAsking(client, next);
+	await client.ensureSession();
+	answer("allow");
+	await sleep(50);
+	const { reply } = await runPrompt(client, "ECHO after");
+	assert.match(reply, /CANCELLEDPERM<<<cancelled>>>/);
+});
+
+test("a permission answer never reaches the agent process that replaced its own", async () => {
+	const { handler, next } = heldHandler();
+	const client = makeClient({ cancelGraceMs: 200, onServerRequest: handler });
+	const firstPid = (await client.ensureReady()).name;
+	await cancelSlowPrompt(client, "SLOW IGNORE-CANCEL");
+	const stale = await cancelWhileAsking(client, next);
+	await client.ensureSession();
+	assert.notEqual(client.info?.name, firstPid, "the second drain timeout restarted the agent");
+	// The old process's held request was its second (srv-2, after the stale one); the new process's
+	// second request reuses that id.
+	const first = runPrompt(client, "PERMISSION");
+	(await next())("allow");
+	await first;
+	const asking = runPrompt(client, "PERMISSION");
+	const current = await next();
+	stale("allow");
+	await sleep(50);
+	current("deny");
+	assert.match((await asking).reply, /\[approved=deny\]/);
+});
+
 test("permission requests without a string session id are answered cancelled", async () => {
 	const asked: unknown[] = [];
 	const client = makeClient({

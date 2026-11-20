@@ -611,7 +611,7 @@ export class AcpClient {
 		createInterface({ input: proc.stdout }).on("line", (line) => {
 			if (this.conn !== conn) return;
 			try {
-				this.handleLine(line);
+				this.handleLine(conn, line);
 			} catch (error) {
 				this.log(`line handler failed: ${String(error)}`);
 			}
@@ -645,8 +645,8 @@ export class AcpClient {
 		terminate(conn.proc);
 	}
 
-	private write(message: object): boolean {
-		const stdin = this.conn?.proc.stdin;
+	private write(message: object, conn: Connection | null = this.conn): boolean {
+		const stdin = conn?.proc.stdin;
 		if (!stdin?.writable) return false;
 		stdin.write(`${JSON.stringify(message)}\n`);
 		return true;
@@ -689,7 +689,7 @@ export class AcpClient {
 		return { id, response };
 	}
 
-	private handleLine(line: string): void {
+	private handleLine(conn: Connection, line: string): void {
 		if (!line.trim()) return;
 		let parsed: unknown;
 		try {
@@ -704,7 +704,7 @@ export class AcpClient {
 			return;
 		}
 		if (message.kind === "request") {
-			void this.answerServerRequest(message.id, message.method, message.params);
+			void this.answerServerRequest(conn, message.id, message.method, message.params);
 		} else if (message.kind === "notification") {
 			if (message.method === "session/update") this.dispatchUpdate(message.params);
 		} else {
@@ -739,16 +739,26 @@ export class AcpClient {
 		if (update) turn.onUpdate(update);
 	}
 
-	private async answerServerRequest(id: RpcId, method: string, params: unknown): Promise<void> {
+	private async answerServerRequest(conn: Connection, id: RpcId, method: string, params: unknown): Promise<void> {
 		const sessionId = isRecord(params) && typeof params.sessionId === "string" ? params.sessionId : undefined;
-		const live = sessionId !== undefined && this.conn?.sessions.has(sessionId) === true;
+		const permission = method === "session/request_permission";
 		// WHY: a cancelled prompt must answer its permission requests `cancelled`; while it drains,
 		// the session has no current prompt whose signal could say so. An ended, unknown or missing
 		// session has no prompt Pi could approve anything for.
-		if (method === "session/request_permission" && (!live || this.drains.has(sessionId))) {
-			this.write({ jsonrpc: "2.0", id, result: { outcome: { outcome: "cancelled" } } });
+		const usable = (): boolean =>
+			sessionId !== undefined && this.conn === conn && conn.sessions.has(sessionId) && !this.drains.has(sessionId);
+		const cancelled = { jsonrpc: "2.0", id, result: { outcome: { outcome: "cancelled" } } };
+		// WARN: replies go to the connection the request came on, never `this.conn`: a restart while the
+		// policy waits would otherwise hand this id to the new process, where it can match its own request.
+		const reply = (message: object): void => {
+			if (this.conn !== conn) return;
+			this.write(permission && !usable() ? cancelled : message, conn);
+		};
+		if (permission && !usable()) {
+			this.write(cancelled, conn);
 			return;
 		}
+		const live = sessionId !== undefined && conn.sessions.has(sessionId);
 		try {
 			const turn = sessionId === undefined ? undefined : this.turns.get(sessionId);
 			const result = await this.options.onServerRequest({
@@ -757,9 +767,9 @@ export class AcpClient {
 				sessionId: live ? sessionId : undefined,
 				signal: turn?.signal,
 			});
-			this.write({ jsonrpc: "2.0", id, result: result ?? null });
+			reply({ jsonrpc: "2.0", id, result: result ?? null });
 		} catch (error) {
-			this.write({
+			reply({
 				jsonrpc: "2.0",
 				id,
 				error: {
