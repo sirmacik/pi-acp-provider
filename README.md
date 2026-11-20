@@ -156,8 +156,11 @@ Global keys:
   a private temp directory; both need a per-process random token. Each ACP
   session also gets its own nonce (in the HTTP path, or `PI_MCP_SESSION` for
   the relay). A call is accepted only from the session of the running turn,
-  and an ended session's nonce is revoked: HTTP answers 403 and its relay
-  connections are closed. Permission requests for Pi's tools are approved,
+  and an ended session's nonce is revoked: HTTP answers 403, its calls still
+  running are cancelled, and its relay connections are closed. Over HTTP,
+  `initialize` issues an `Mcp-Session-Id`; a cancellation sent in a later
+  POST of that MCP session reaches its call, and `DELETE` cancels the
+  session's calls and ends it. Permission requests for Pi's tools are approved,
   since Pi applies its own approval when it runs them.
 - **System prompt**: Pi's system prompt goes to each ACP session once (see
   `systemPrompt`), and a changed prompt is sent with the next prompt.

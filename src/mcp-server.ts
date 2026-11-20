@@ -117,11 +117,31 @@ export function toMcpTool(tool: { name: string; description: string; parameters:
 	return { name: tool.name, description: [note, tool.description].filter(Boolean).join("\n\n"), inputSchema: schema };
 }
 
+/** The decoded path segment, or null when it is not valid percent-encoding. */
+function decodePathSegment(segment: string): string | null {
+	try {
+		return decodeURIComponent(segment);
+	} catch {
+		return null;
+	}
+}
+
 const rpcResult = (id: JsonRpcId, result: unknown) => ({ jsonrpc: "2.0", id, result });
 const rpcError = (id: JsonRpcId | null, code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
 
-/** In-flight `tools/call` requests of one connection, for `notifications/cancelled`. */
+/** In-flight `tools/call` requests of one connection or HTTP MCP session, for `notifications/cancelled`. */
 type Inflight = Map<JsonRpcId, AbortController>;
+
+/** An HTTP MCP session, issued as `Mcp-Session-Id` on `initialize`, so a cancellation in a later POST reaches its call. */
+interface HttpSession {
+	nonce: string;
+	inflight: Inflight;
+}
+
+const abortAll = (inflight: Inflight): void => {
+	for (const controller of inflight.values()) controller.abort();
+	inflight.clear();
+};
 
 export class PiMcpServer {
 	private readonly options: PiMcpServerOptions;
@@ -135,6 +155,11 @@ export class PiMcpServer {
 	private readonly sockets = new Map<Socket, { agentId: string; nonce: string }>();
 	/** Minted session nonces, by nonce, with the agent each was minted for. */
 	private readonly nonces = new Map<string, string>();
+	/**
+	 * HTTP MCP sessions by `Mcp-Session-Id`; a request without that header shares its
+	 * nonce's entry under the key `nonce:<nonce>`, which never collides with a minted id.
+	 */
+	private readonly httpSessions = new Map<string, HttpSession>();
 	private started: Promise<void> | null = null;
 
 	constructor(options: PiMcpServerOptions) {
@@ -157,6 +182,11 @@ export class PiMcpServer {
 	/** Refuses the nonce from now on and closes the stdio connections that use it. */
 	revoke(nonce: string): void {
 		this.nonces.delete(nonce);
+		for (const [key, session] of this.httpSessions) {
+			if (session.nonce !== nonce) continue;
+			this.httpSessions.delete(key);
+			abortAll(session.inflight);
+		}
 		for (const [socket, owner] of this.sockets) {
 			if (owner.nonce !== nonce) continue;
 			this.sockets.delete(socket);
@@ -201,6 +231,8 @@ export class PiMcpServer {
 		for (const socket of this.sockets.keys()) socket.destroy();
 		this.sockets.clear();
 		this.nonces.clear();
+		for (const session of this.httpSessions.values()) abortAll(session.inflight);
+		this.httpSessions.clear();
 		if (this.socketDir) rmSync(this.socketDir, { recursive: true, force: true });
 		this.http = null;
 		this.socketServer = null;
@@ -208,8 +240,18 @@ export class PiMcpServer {
 		this.started = null;
 	}
 
-	/** Answers one JSON-RPC message; null for notifications and responses. */
+	/** Answers one JSON-RPC message; null for notifications and responses. Never rejects. */
 	private async handle(message: unknown, agentId: string, nonce: string, inflight: Inflight): Promise<object | null> {
+		try {
+			return await this.dispatch(message, agentId, nonce, inflight);
+		} catch (error) {
+			const id = isRecord(message) && (typeof message.id === "string" || typeof message.id === "number") ? message.id : null;
+			this.options.log?.(`mcp request failed: ${error instanceof Error ? error.message : String(error)}`);
+			return id === null ? null : rpcError(id, -32603, "Internal error");
+		}
+	}
+
+	private async dispatch(message: unknown, agentId: string, nonce: string, inflight: Inflight): Promise<object | null> {
 		if (!isRecord(message) || typeof message.method !== "string") return null;
 		const { method } = message;
 		const id = typeof message.id === "string" || typeof message.id === "number" ? message.id : undefined;
@@ -255,7 +297,13 @@ export class PiMcpServer {
 	}
 
 	private startHttp(): Promise<void> {
-		const server = createHttpServer((request, response) => void this.serveHttp(request, response));
+		const server = createHttpServer((request, response) => {
+			this.serveHttp(request, response).catch((error: unknown) => {
+				this.options.log?.(`mcp http request failed: ${error instanceof Error ? error.message : String(error)}`);
+				if (!response.headersSent) response.writeHead(500).end();
+				else response.destroy();
+			});
+		});
 		// A tool call stays open while Pi runs the tool, which can wait on the user.
 		server.requestTimeout = 0;
 		server.timeout = 0;
@@ -274,14 +322,31 @@ export class PiMcpServer {
 		const match = /^\/mcp\/([^/?]+)\/([^/?]+)/.exec(request.url ?? "");
 		if (!match?.[1] || !match[2]) return void response.writeHead(404).end();
 		if (request.headers.authorization !== `Bearer ${this.token}`) return void response.writeHead(401).end();
-		const agentId = decodeURIComponent(match[1]);
+		const agentId = decodePathSegment(match[1]);
+		if (agentId === null) return void response.writeHead(400).end();
 		const nonce = match[2];
 		if (this.nonces.get(nonce) !== agentId) return void response.writeHead(403).end();
-		if (request.method === "DELETE") return void response.writeHead(200).end();
+		const sessionHeader = request.headers["mcp-session-id"];
+		const sessionKey = typeof sessionHeader === "string" ? sessionHeader : `nonce:${nonce}`;
+		const known = this.httpSessions.get(sessionKey);
+		// The spec's answer to an unknown or ended session is 404, after which the client initializes again.
+		if (typeof sessionHeader === "string" && known?.nonce !== nonce) return void response.writeHead(404).end();
+		if (request.method === "DELETE") {
+			if (known) {
+				this.httpSessions.delete(sessionKey);
+				abortAll(known.inflight);
+			}
+			return void response.writeHead(200).end();
+		}
 		// No server-initiated stream: the spec allows 405 for GET.
 		if (request.method !== "POST") return void response.writeHead(405, { Allow: "POST, DELETE" }).end();
 		const chunks: Buffer[] = [];
-		for await (const chunk of request) chunks.push(chunk as Buffer);
+		try {
+			for await (const chunk of request) chunks.push(chunk as Buffer);
+		} catch {
+			// The client went away mid-upload; there is nobody to answer.
+			return void response.destroy();
+		}
 		// WHY: the session may have been revoked while the body was uploading.
 		if (this.nonces.get(nonce) !== agentId) return void response.writeHead(403).end();
 		let body: unknown;
@@ -291,18 +356,34 @@ export class PiMcpServer {
 			response.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify(rpcError(null, -32700, "Parse error")));
 			return;
 		}
-		const inflight: Inflight = new Map();
-		response.on("close", () => {
-			if (!response.writableFinished) for (const controller of inflight.values()) controller.abort();
-		});
 		const messages = Array.isArray(body) ? body : [body];
+		const initializing = messages.some((message) => isRecord(message) && message.method === "initialize");
+		let session = this.httpSessions.get(sessionKey);
+		// WHY: a DELETE may have ended the MCP session while the body was uploading.
+		if (typeof sessionHeader === "string" && !session) return void response.writeHead(404).end();
+		const headers: Record<string, string> = { "Content-Type": "application/json" };
+		if (initializing && typeof sessionHeader !== "string") {
+			const id = randomBytes(16).toString("hex");
+			session = { nonce, inflight: new Map() };
+			this.httpSessions.set(id, session);
+			headers["Mcp-Session-Id"] = id;
+		} else if (!session) {
+			session = { nonce, inflight: new Map() };
+			this.httpSessions.set(sessionKey, session);
+		}
+		const { inflight } = session;
+		const callIds = messages.flatMap((message) =>
+			isRecord(message) && message.method === "tools/call" && (typeof message.id === "string" || typeof message.id === "number") ? [message.id] : [],
+		);
+		response.on("close", () => {
+			if (response.writableFinished) return;
+			for (const id of callIds) inflight.get(id)?.abort();
+		});
 		const replies = (await Promise.all(messages.map((message) => this.handle(message, agentId, nonce, inflight)))).filter(
 			(reply): reply is object => reply !== null,
 		);
-		if (replies.length === 0) return void response.writeHead(202).end();
-		response
-			.writeHead(200, { "Content-Type": "application/json" })
-			.end(JSON.stringify(Array.isArray(body) ? replies : replies[0]));
+		if (replies.length === 0) return void response.writeHead(202, headers).end();
+		response.writeHead(200, headers).end(JSON.stringify(Array.isArray(body) ? replies : replies[0]));
 	}
 
 	private startSocket(): Promise<void> {
