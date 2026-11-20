@@ -81,6 +81,17 @@ export interface PromptRequest {
 	 */
 	onSent?: (() => void) | undefined;
 	signal?: AbortSignal | undefined;
+	/** The session instance (`AcpClient.instance`) the prompt is for; refused once that one ended. */
+	instance?: SessionInstance | undefined;
+}
+
+declare const sessionInstanceBrand: unique symbol;
+/**
+ * One session of one agent process. Session ids repeat across processes (a respawned agent numbers its
+ * sessions again), so an id alone can name another conversation's new session.
+ */
+export interface SessionInstance {
+	readonly [sessionInstanceBrand]: true;
 }
 
 export type PromptResult = { kind: "finished"; stopReason: AcpStopReason; usage: AcpUsage | undefined } | { kind: "aborted" };
@@ -188,7 +199,7 @@ const abortError = (): Error => new Error("Request was aborted");
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** Rejects as soon as `signal` aborts; the underlying work keeps running. */
-function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+export function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
 	if (!signal) return promise;
 	if (signal.aborted) return Promise.reject(abortError());
 	return new Promise<T>((resolve, reject) => {
@@ -279,6 +290,8 @@ export class AcpClient {
 	private readonly turns = new Map<string, PromptRequest>();
 	/** Cancelled prompts whose `cancelled` response has not arrived yet, by session id. */
 	private readonly drains = new Map<string, Drain>();
+	/** The settings changes queued on each session, by session id: each waits for the ones before it. */
+	private readonly settingChanges = new Map<string, Promise<void>>();
 	/** Drain timeouts in a row; a drain that ends in time, or a restart, resets it. */
 	private drainTimeouts = 0;
 	/** The drain-timeout recovery in progress for each conversation; its concurrent `ensureSession` calls share it. */
@@ -454,6 +467,18 @@ export class AcpClient {
 		return [];
 	}
 
+	/** The current instance of the live session `sessionId`, to bind later calls to it. */
+	instance(sessionId: string): SessionInstance | undefined {
+		return this.conn?.sessions.get(sessionId) as SessionInstance | undefined;
+	}
+
+	/** Throws when `instance` is given and the live session `sessionId` is no longer that instance. */
+	private assertInstance(sessionId: string, instance: SessionInstance | undefined): void {
+		if (instance !== undefined && this.instance(sessionId) !== instance) {
+			throw new Error(`${this.options.agent.name} session ${sessionId} ended (the agent restarted or the session was replaced)`);
+		}
+	}
+
 	/** The models and reasoning levels a live session offers. */
 	sessionConfig(sessionId: string): AcpSessionConfig | undefined {
 		return this.conn?.sessions.get(sessionId)?.config;
@@ -466,23 +491,42 @@ export class AcpClient {
 
 	/**
 	 * Changes the session's model or reasoning level, via
-	 * `session/set_config_option` or the legacy `session/set_model`.
+	 * `session/set_config_option` or the legacy `session/set_model`, after every change queued on the
+	 * session before it; an aborted caller stops waiting, but a change already sent still lands.
+	 * WARN: the cached value is compared only once the earlier changes landed: a caller that left mid-change
+	 * must not make a later caller skip a write the agent still needs.
 	 */
-	async setSessionSetting(sessionId: string, setting: SessionSetting, value: string, signal?: AbortSignal): Promise<void> {
+	async setSessionSetting(
+		sessionId: string,
+		setting: SessionSetting,
+		value: string,
+		signal?: AbortSignal,
+		instance?: SessionInstance,
+	): Promise<void> {
+		signal?.throwIfAborted();
+		this.assertInstance(sessionId, instance);
+		const change = (this.settingChanges.get(sessionId) ?? Promise.resolve()).then(() => this.applySetting(sessionId, setting, value, instance));
+		const settled = change.catch(() => {});
+		this.settingChanges.set(sessionId, settled);
+		void settled.then(() => {
+			if (this.settingChanges.get(sessionId) === settled) this.settingChanges.delete(sessionId);
+		});
+		await abortable(change, signal);
+	}
+
+	private async applySetting(sessionId: string, setting: SessionSetting, value: string, instance: SessionInstance | undefined): Promise<void> {
+		this.assertInstance(sessionId, instance);
 		const session = this.conn?.sessions.get(sessionId);
 		const select = session?.config[setting];
 		if (!session || !select) throw new Error(`${this.options.agent.name} offers no ${setting} setting for this session`);
 		if (select.currentValue === value) return;
 		const timeout = this.options.handshakeTimeoutMs;
 		if (select.configId === null) {
-			await abortable(this.request("session/set_model", { sessionId, modelId: value }, timeout), signal);
+			await this.request("session/set_model", { sessionId, modelId: value }, timeout);
 			select.currentValue = value;
 			return;
 		}
-		const result = await abortable(
-			this.request("session/set_config_option", { sessionId, configId: select.configId, value }, timeout),
-			signal,
-		);
+		const result = await this.request("session/set_config_option", { sessionId, configId: select.configId, value }, timeout);
 		session.config = parseSessionConfig(result, session.config);
 	}
 
@@ -505,6 +549,7 @@ export class AcpClient {
 	/** Sends one `session/prompt` and resolves when the turn finishes or is aborted. */
 	async prompt(request: PromptRequest): Promise<PromptResult> {
 		const { sessionId, signal } = request;
+		this.assertInstance(sessionId, request.instance);
 		if (this.busy.has(sessionId)) throw new Error(`Another ${this.options.agent.name} prompt is already in flight`);
 		this.busy.add(sessionId);
 		for (const slot of this.conn?.slots.values() ?? []) if (slot.id === sessionId) slot.used = true;
@@ -514,6 +559,7 @@ export class AcpClient {
 			}
 			if (signal?.aborted) return { kind: "aborted" };
 			if (this.conn?.ended.has(sessionId)) throw new Error(`${this.options.agent.name} session ${sessionId} has ended`);
+			this.assertInstance(sessionId, request.instance);
 			this.turns.set(sessionId, request);
 			const { id: requestId, response } = this.send("session/prompt", request.payload);
 			request.onSent?.();

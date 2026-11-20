@@ -53,7 +53,7 @@ import {
 	type Usage,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
-import { AcpClient, AcpRpcError, type PromptResult, type ServerRequest, type SessionSetup } from "./acp-client.ts";
+import { AcpClient, AcpRpcError, abortable, type PromptResult, type ServerRequest, type SessionInstance, type SessionSetup } from "./acp-client.ts";
 import {
 	ACP_AUTH_REQUIRED,
 	RPC_INVALID_PARAMS,
@@ -442,6 +442,8 @@ interface LiveTurn {
 	modelId: string;
 	acp: AcpClient;
 	sessionId: string;
+	/** The session instance the turn set up; its prompts are refused once that one ended. */
+	instance: SessionInstance | undefined;
 	controller: AbortController;
 	native: boolean;
 	steering: boolean;
@@ -965,6 +967,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const systemPrompt = getCurrentSystemPrompt(context.messages);
 		// Setup failures (spawn, handshake, session) end the stream before `start`.
 		let sessionId: string;
+		let instance: SessionInstance | undefined;
 		let state: SyncState;
 		let info: AcpAgentInfo;
 		try {
@@ -1000,7 +1003,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			};
 			sync.set(turnKey(agent.id, sessionId), state);
 			info = acp.info ?? (await acp.ensureReady(setupSignal));
-			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions);
+			instance = acp.instance(sessionId);
+			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions, setupSignal, instance);
 			setupSignal.throwIfAborted();
 		} catch (error) {
 			abortedOrError(error);
@@ -1076,9 +1080,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		let sent: PromptPart[];
 		try {
 			const defaultPayload = { sessionId, prompt: blocks };
-			payload = (await streamOptions?.onPayload?.(defaultPayload, model)) ?? defaultPayload;
+			// WHY: a superseded request must end now, not once its hook returns.
+			payload = (await abortable(Promise.resolve(streamOptions?.onPayload?.(defaultPayload, model)), setupSignal)) ?? defaultPayload;
 			sent = partsIn(parts, payload);
 			setupSignal.throwIfAborted();
+			// WHY: checked before the turn is published: while the hook ran, the agent may have restarted
+			// and handed this session id to another conversation's new session.
+			if (acp.instance(sessionId) !== instance) {
+				throw new Error(`${agent.name} session ${sessionId} ended while the request was being prepared; send the message again.`);
+			}
 		} catch (error) {
 			abortedOrError(error);
 			return;
@@ -1098,6 +1108,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			modelId: model.id,
 			acp,
 			sessionId,
+			instance,
 			controller: claim,
 			native: options.nativeTools?.() === true,
 			steering: info.capabilities.steering,
@@ -1225,6 +1236,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		turn.acp
 			.prompt({
 				sessionId: turn.sessionId,
+				instance: turn.instance,
 				payload: prompt.payload,
 				signal: turn.controller.signal,
 				onRawUpdate: turn.onRawUpdate,
@@ -1533,8 +1545,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		modelId: string | undefined,
 		model: Model<Api>,
 		streamOptions: StreamOptions | undefined,
+		signal = streamOptions?.signal,
+		instance?: SessionInstance,
 	): Promise<void> {
-		const signal = streamOptions?.signal;
 		const select = acp.sessionConfig(sessionId)?.model;
 		if (modelId !== undefined) {
 			if (!select) throw new Error(`${agent.name} does not support choosing a model over ACP.`);
@@ -1545,7 +1558,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		// The bare `acp/<agent id>` model means the model the session started with.
 		const wantedModel = modelId ?? acp.initialModel(sessionId);
-		if (select && wantedModel !== undefined) await acp.setSessionSetting(sessionId, "model", wantedModel, signal);
+		if (select && wantedModel !== undefined) await acp.setSessionSetting(sessionId, "model", wantedModel, signal, instance);
 
 		// Re-read: switching models can change the offered reasoning levels.
 		const thoughtLevel = acp.sessionConfig(sessionId)?.thoughtLevel;
@@ -1556,7 +1569,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			log?.(`${agent.id}: no thought_level value for thinking level '${level}'; keeping the agent's setting`);
 			return;
 		}
-		await acp.setSessionSetting(sessionId, "thoughtLevel", value, signal);
+		await acp.setSessionSetting(sessionId, "thoughtLevel", value, signal, instance);
 	}
 
 	/** Lists one agent's models from a (possibly new) session, without interactive sign-in. */

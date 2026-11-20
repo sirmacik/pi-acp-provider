@@ -301,7 +301,7 @@ for (const sessionId of [undefined, "conv"]) {
 	});
 }
 
-test("a request replacing one paused in onPayload owns the turn, and the paused one ends aborted", async () => {
+test("a request replacing one paused in onPayload owns the turn, and the paused one ends aborted while its hook still waits", async () => {
 	const handle = makeProvider();
 	const model = firstModel(handle);
 	let release: () => void = () => {};
@@ -331,9 +331,10 @@ test("a request replacing one paused in onPayload owns the turn, and the paused 
 		return events.at(-1);
 	})();
 	await underWay;
+	const ended = await Promise.race([first, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000))]);
 	release();
-	const firstLast = (await first).at(-1);
-	assert.ok(firstLast?.type === "error", `the replaced request ends with ${firstLast?.type}`);
+	const firstLast = ended?.at(-1);
+	assert.ok(firstLast?.type === "error", `the replaced request ends with ${firstLast?.type ?? "nothing while its hook waits"}`);
 	assert.equal(firstLast.reason, "aborted", firstLast.error.errorMessage ?? "");
 	const secondLast = await second;
 	assert.ok(secondLast?.type === "done", `the replacing request ends with ${secondLast?.type}`);
@@ -808,4 +809,64 @@ test("native tools: two conversations' mirrored calls get distinct ids and stay 
 	const last = (await collect(handle.provider.streamSimple(model, normalizeContext({ messages: a.messages }), { sessionId: "conv-a" }))).at(-1);
 	assert.ok(last?.type === "done", `conversation a ends with ${last?.type}`);
 	assert.match(messageText(last.message), /^Hello world #\d+$/);
+});
+
+test("a prompt prepared before the agent restarted is not sent into another conversation's new session of the same id", async () => {
+	const handle = makeProvider();
+	const model = firstModel(handle);
+	let release: () => void = () => {};
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let paused: () => void = () => {};
+	const reached = new Promise<void>((resolve) => (paused = resolve));
+	const held = collect(
+		handle.provider.streamSimple(model, userContext("ECHO held"), {
+			sessionId: "conv-a",
+			onPayload: async () => {
+				paused();
+				await gate;
+				return undefined;
+			},
+		}),
+	);
+	await reached;
+	const crashed = (await collect(handle.provider.streamSimple(model, userContext("CRASH now"), { sessionId: "conv-b" }))).at(-1);
+	assert.equal(crashed?.type, "error");
+	const fresh = (await collect(handle.provider.streamSimple(model, userContext("ECHO fresh"), { sessionId: "conv-c" }))).at(-1);
+	assert.ok(fresh?.type === "done");
+	assert.match(messageText(fresh.message), /^ECHO\[sess-1\]<<</, "the respawned agent reuses the held request's session id");
+	release();
+	const last = (await held).at(-1);
+	assert.ok(last?.type === "error", `the held request ends with ${last?.type}: ${last?.type === "done" ? messageText(last.message) : ""}`);
+	assert.match(last.error.errorMessage ?? "", /session sess-1 ended while the request was being prepared/);
+	const after = (await collect(handle.provider.streamSimple(model, userContext("ECHO after"), { sessionId: "conv-c" }))).at(-1);
+	assert.ok(after?.type === "done");
+	assert.doesNotMatch(messageText(after.message), /ECHO held/);
+});
+
+test("a replacement's model is applied after a superseded request's settings change lands", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config", FAKE_SETTING_DELAY: "300" } })]);
+	await handle.provider.refreshModels?.(storeContext().context);
+	const smart = handle.provider.getModels().find((candidate) => candidate.id === "fake/smart");
+	assert.ok(smart);
+	const bare = firstModel(handle);
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }];
+	const warm = (await collect(handle.provider.streamSimple(bare, normalizeContext({ messages }), { sessionId: "conv" }))).at(-1);
+	assert.ok(warm?.type === "done");
+	assert.match(messageText(warm.message), /\[model=fast /);
+	messages.push(warm.message, { role: "user", content: [{ type: "text", text: "SLOW again" }], timestamp: Date.now() + 1 });
+	const superseded = collect(handle.provider.streamSimple(smart, normalizeContext({ messages }), { sessionId: "conv" }));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	// WHY: the fake reads its model when a prompt starts, so the replacement's prompt waits until the
+	// superseded change (sent at about 0 ms, answered at 300 ms) has landed.
+	const replacement = (
+		await collect(
+			handle.provider.streamSimple(bare, normalizeContext({ messages }), {
+				sessionId: "conv",
+				onPayload: () => new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 400)),
+			}),
+		)
+	).at(-1);
+	assert.equal((await superseded).at(-1)?.type, "error");
+	assert.ok(replacement?.type === "done", `the replacement ends with ${replacement?.type}`);
+	assert.match(messageText(replacement.message), /\[model=fast /);
 });

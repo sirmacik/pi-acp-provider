@@ -136,7 +136,9 @@ Global keys:
   `/resume`, quit, reload). Each agent runs in its own process group, so the
   whole tree (including tool subprocesses) is killed. Parent signal hooks,
   shared by all agents, cover exits without a session shutdown. A crashed
-  agent is respawned with a fresh session on the next prompt.
+  agent is respawned with a fresh session on the next prompt; a request that
+  was still being prepared when its agent exited fails with a request to send
+  the message again, rather than reaching the respawned agent's sessions.
 - **Session mapping**: one ACP session per Pi session per agent. Pi sessions
   that stream at the same time in one Pi process (for example an extension's
   side conversation) run in separate ACP sessions of the same agent process,

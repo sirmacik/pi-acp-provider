@@ -682,10 +682,17 @@ type Payload = { sessionId: string; prompt: { type: string; text?: string }[] };
  * One provider call that records the prompt text it sends, after `hook` (an `onPayload` that may throw
  * or change the payload); returns the final message, whatever its end.
  */
-async function capture(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, hook?: (payload: Payload) => Payload | void) {
+async function capture(
+	handle: AcpProviderHandle,
+	messages: Message[],
+	systemPrompt?: string,
+	hook?: (payload: Payload) => Payload | void,
+	extra: Record<string, unknown> = {},
+) {
 	const prompts: string[] = [];
 	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools: [echoTool], messages });
 	const options = {
+		...extra,
 		onPayload: (payload: unknown) => {
 			const final = hook?.(payload as Payload) ?? (payload as Payload);
 			prompts.push(final.prompt.map((block) => block.text ?? `[${block.type}]`).join("\n"));
@@ -942,4 +949,19 @@ test("two conversations of one agent each list, approve and call their own Pi to
 	const last = await step(handle, messages, undefined, { tools: [alpha], sessionId: "conv-a" });
 	assert.match(textOf(last), /PERM<<<allow>>> TOOLS<<<alpha>>> RESULT<<<alpha ran>>>/);
 	assert.deepEqual(asked, [], "conversation a's own tool is approved without the policy");
+});
+
+test("a pending steer stays with its conversation while a sibling conversation of the agent runs", async () => {
+	const handle = makeProvider([agent()]);
+	const conversationA = { sessionId: "conv-a" };
+	const messages: Message[] = [user("ECHO one"), user("two")];
+	const partial = await capture(handle, messages, undefined, (payload) => {
+		payload.prompt.splice(0, payload.prompt.length, ...payload.prompt.filter((block) => block.text !== "two"));
+	}, conversationA);
+	assert.equal(partial.prompt, "ECHO one");
+	const sibling = await capture(handle, [user("ECHO sibling")], undefined, undefined, { sessionId: "conv-b" });
+	assert.equal(sibling.prompt, "ECHO sibling", "the sibling conversation does not get the other one's steer");
+	messages.push(partial.message, user("ECHO three"));
+	const next = await capture(handle, messages, undefined, undefined, conversationA);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\ntwo\nECHO three$/);
 });

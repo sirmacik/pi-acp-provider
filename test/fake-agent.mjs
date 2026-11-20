@@ -26,6 +26,7 @@
  *                   Replies end with "[model=<id> thought=<level>]".
  *     FAKE_DEFAULT_MODEL=<id>  the model new sessions start on (default "fast")
  *     FAKE_THOUGHT_CATEGORY=<c>  category of the reasoning option (default "thought_level")
+ *     FAKE_SETTING_DELAY=<ms>  applies and answers each session/set_config_option after <ms>
  *   - "/context"    (whole prompt) answers like an agent slash command
  *   - FAKE_PROTOCOL=n answers initialize with protocol version n
  *   - FAKE_AUTH=1   session/new fails with auth_required until `authenticate`
@@ -573,8 +574,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 				replyError(message.id, -32602, "unknown config option");
 				break;
 			}
-			settings[configId === "model" ? "model" : "thought"] = value;
-			reply(message.id, { configOptions: configOptions() });
+			const { id } = message;
+			const apply = () => {
+				settings[configId === "model" ? "model" : "thought"] = value;
+				reply(id, { configOptions: configOptions() });
+			};
+			const delay = Number(process.env.FAKE_SETTING_DELAY ?? 0);
+			if (delay > 0) setTimeout(apply, delay);
+			else apply();
 			break;
 		}
 		case "session/set_model":
