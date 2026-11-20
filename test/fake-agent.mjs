@@ -13,7 +13,8 @@
  *   - "REFUSAL"     finishes with stopReason "refusal"
  *   - "ONESHOT"     first reports a tool call that is already completed
  *   - "DIFF"        first reports an edit tool call with a diff
- *   - "USAGE"       sends usage_update (used 1234) and a summed prompt `usage`
+ *   - "USAGE"       sends usage_update (used 1234, size 200000) and a summed prompt `usage`
+ *     FAKE_USAGE_SIZE=<raw JSON number>  sends that literal as the size instead (e.g. 1e999)
  *   - "LONGLOOP"    like USAGE, but a many-call turn whose summed cacheRead is far past the
  *                   128k window while usage_update reports 100000 ("NOUPDATE" omits it)
  *   - FAKE_SPLIT=1  writes stdout in small split chunks (line-buffer test)
@@ -310,7 +311,12 @@ async function handlePrompt(message) {
 		});
 	}
 	if (text.includes("USAGE")) {
-		update(sessionId, { sessionUpdate: "usage_update", used: 1234, size: 200000 });
+		const rawSize = process.env.FAKE_USAGE_SIZE;
+		if (rawSize === undefined) update(sessionId, { sessionUpdate: "usage_update", used: 1234, size: 200000 });
+		else {
+			const line = JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "usage_update", used: 1234, size: "__SIZE__" } } });
+			process.stdout.write(line.replace('"__SIZE__"', rawSize) + "\n");
+		}
 		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } });
 		return reply(message.id, {
 			stopReason: "end_turn",

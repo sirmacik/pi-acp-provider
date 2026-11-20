@@ -12,7 +12,7 @@ import type {
 	Api,
 } from "@earendil-works/pi-ai";
 import { createAcpProvider, type AcpProviderOptions, type AcpProviderHandle } from "../src/provider.ts";
-import type { AcpAgentConfig } from "../src/config.ts";
+import { AGENT_PRESETS, type AcpAgentConfig } from "../src/config.ts";
 import { toToolResult, type AcpToolDetails } from "../src/native-tools.ts";
 
 const fakePath = fileURLToPath(new URL("./fake-agent.mjs", import.meta.url));
@@ -140,6 +140,108 @@ for (const [label, options] of [
 		assert.equal(isContextOverflow(last.message, model.contextWindow), false);
 	});
 }
+
+async function refreshOffline(handle: AcpProviderHandle, stored?: Model<Api>[]): Promise<Model<Api>[]> {
+	let published: Model<Api>[] = [];
+	await handle.provider.refreshModels?.({
+		allowNetwork: false,
+		signal: new AbortController().signal,
+		...(stored ? { stored: { models: stored, checkedAt: 0 } } : {}),
+		publish: async ({ persist, update }) => {
+			published = (persist?.models ?? []) as Model<Api>[];
+			update?.();
+			return true;
+		},
+	});
+	return published;
+}
+
+for (const [label, options] of [
+	["a live turn", {}],
+	["an isolated request", { cacheRetention: "none" }],
+] as const) {
+	test(`the refreshed catalogue takes the window the agent reported (${label})`, async () => {
+		const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+		const model = firstModel(handle);
+		assert.equal(model.contextWindow, 128_000);
+		const last = (await collect(handle.provider.streamSimple(model, userContext("USAGE please"), options))).at(-1);
+		assert.ok(last?.type === "done");
+		const published = await refreshOffline(handle);
+		assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 200_000], ["other", 128_000]]);
+		assert.deepEqual(handle.provider.getModels().map((entry) => entry.contextWindow), [200_000, 128_000]);
+	});
+}
+
+test("a window reported for one of the agent's models applies to that model only", async () => {
+	const handle = makeProvider([fakeAgent({ env: { FAKE_MODELS: "config" } })]);
+	await handle.provider.refreshModels?.({ allowNetwork: true, signal: new AbortController().signal, publish: async ({ update }) => (update?.(), true) });
+	const smart = handle.provider.getModels().find((entry) => entry.id === "fake/smart");
+	assert.ok(smart);
+	assert.ok((await lastEvent(handle, "USAGE please", smart))?.type === "done");
+	const published = await refreshOffline(handle);
+	assert.deepEqual(
+		published.map((entry) => [entry.id, entry.contextWindow]),
+		[["fake", 128_000], ["fake/fast", 128_000], ["fake/smart", 200_000]],
+	);
+});
+
+test("a persisted reported window survives rediscovery", async () => {
+	const handle = makeProvider();
+	const stored = handle.provider.getModels().map((entry) => ({ ...entry, contextWindow: 200_000 }));
+	await handle.provider.refreshModels?.({
+		allowNetwork: true,
+		signal: new AbortController().signal,
+		stored: { models: stored, checkedAt: 0 },
+		publish: async ({ update }) => (update?.(), true),
+	});
+	assert.equal(firstModel(handle).contextWindow, 200_000);
+});
+
+for (const size of ["1e999", "0", "-5", "12.5", '"200000"', "null"]) {
+	test(`a reported size of ${size} keeps the configured window`, async () => {
+		const handle = makeProvider([fakeAgent({ env: { FAKE_USAGE_SIZE: size } })]);
+		assert.ok((await lastEvent(handle, "USAGE please"))?.type === "done");
+		const published = await refreshOffline(handle);
+		assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 128_000]]);
+		assert.equal(JSON.parse(JSON.stringify(published))[0].contextWindow, 128_000);
+	});
+}
+
+test("a persisted window that is not a positive integer is not restored", async () => {
+	const handle = makeProvider();
+	const stored = handle.provider.getModels().map((entry) => ({ ...entry, contextWindow: null as unknown as number }));
+	const published = await refreshOffline(handle, stored);
+	assert.deepEqual(published.map((entry) => [entry.id, entry.contextWindow]), [["fake", 128_000]]);
+});
+
+async function isolatedSessionParams(agent: AcpAgentConfig) {
+	const handle = makeProvider([agent]);
+	const last = (await collect(handle.provider.streamSimple(firstModel(handle), userContext("SESSIONINFO"), { cacheRetention: "none" }))).at(-1);
+	assert.ok(last?.type === "done");
+	return JSON.parse(messageText(last.message)) as { mcpServers: unknown[]; _meta?: unknown };
+}
+
+test("an isolated request runs with the agent's own tools off when its preset can turn them off", async () => {
+	const claude = AGENT_PRESETS["claude-agent-acp"];
+	assert.ok(claude?.ownToolsOffMeta && claude.sessionMeta);
+	const params = await isolatedSessionParams(
+		fakeAgent({ piTools: "pi", sessionMeta: claude.sessionMeta, ownToolsOffMeta: claude.ownToolsOffMeta }),
+	);
+	assert.deepEqual(params.mcpServers, []);
+	assert.deepEqual(params._meta, {
+		claudeCode: { options: { allowedTools: ["mcp__pi"], tools: [], strictMcpConfig: true } },
+	});
+});
+
+test("an isolated request keeps the session params of an agent without a tools switch", async () => {
+	const codex = AGENT_PRESETS["codex-acp"];
+	assert.ok(codex && codex.ownToolsOffMeta === undefined);
+	const params = await isolatedSessionParams(
+		fakeAgent({ piTools: codex.piTools ?? "both", sessionMeta: { vendor: { option: true } }, ownToolsOffMeta: codex.ownToolsOffMeta }),
+	);
+	assert.deepEqual(params.mcpServers, []);
+	assert.equal(params._meta, undefined);
+});
 
 test("without usage_update the turn's summed usage is reported unchanged", async () => {
 	const handle = makeProvider();

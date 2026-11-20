@@ -224,7 +224,7 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 			return {
 				type: "usage_update",
 				used: update.used,
-				size: typeof update.size === "number" && update.size > 0 ? update.size : undefined,
+				size: Number.isSafeInteger(update.size) && (update.size as number) > 0 ? (update.size as number) : undefined,
 			};
 		default:
 			return null;

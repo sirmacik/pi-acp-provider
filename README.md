@@ -75,6 +75,15 @@ option, Pi's thinking level (`shift+tab`, `--thinking`) is applied to it; levels
 the agent doesn't offer are hidden. Discovery never triggers `authMethod`
 sign-in; that waits for the first prompt.
 
+Each model's context window starts at 128K. Once the agent reports its real
+window (`size` in an ACP `usage_update`) during a turn, the next model list
+refresh publishes that value for the model that ran the turn, and it is saved
+with the list. A `contextWindow` in a `~/.pi/agent/models.json`
+`modelOverrides` entry (for example
+`{ "providers": { "acp": { "modelOverrides": { "claude": { "contextWindow": 1000000 } } } } }`
+for `acp/claude`) always wins over both, since Pi applies it on top of the
+provider's list.
+
 ### Agent slash commands
 
 Each agent registers a Pi command named after its key. `/<key> <command>`
@@ -97,7 +106,7 @@ Per-agent keys:
 | `mcpTransport` | no | `stdio` or `http` for Pi's MCP server. `http` falls back to stdio when the agent does not advertise it. |
 | `systemPrompt` | no | `prompt` (in front of the first prompt), `session` (ACP `systemPrompt` on `session/new`; falls back to `prompt`), or `off`. |
 | `sessionMeta` | no | Extra `_meta` for `session/new`, merged over the preset. |
-| `ownToolsOffMeta` | no | `_meta` that turns off the agent's own tools, merged in only with `piTools: "pi"`. |
+| `ownToolsOffMeta` | no | `_meta` that turns off the agent's own tools. Live sessions merge it in only with `piTools: "pi"`; isolated requests (summaries) always send it, merged over `sessionMeta`, whatever `piTools` says. |
 
 #### Defaults and presets
 
@@ -141,7 +150,8 @@ Global keys:
   as the server `pi` (`mcp__pi__<tool>` in Claude Code). A call ends the Pi
   message with a real Pi tool call; Pi runs it and the result answers the
   agent's MCP request, and the ACP turn continues. A changed loadout is served
-  on the next `tools/list` (stdio connections also get `list_changed`).
+  on the next `tools/list` (stdio connections also get `list_changed`; HTTP
+  connections do not, see Known limitations).
   The HTTP transport listens on 127.0.0.1 and the stdio relay uses a socket in
   a private temp directory; both need a per-process random token. Each ACP
   session also gets its own nonce (in the HTTP path, or `PI_MCP_SESSION` for
@@ -158,7 +168,11 @@ Global keys:
   running one ends. The running turn is not cancelled.
 - **Isolated requests**: compaction and branch summaries (`cacheRetention:
   "none"`) run in a separate, throwaway agent process, so the live session
-  is not touched. Cache-warming requests are answered without contacting the
+  is not touched. They get no Pi tools, and when the agent has
+  `ownToolsOffMeta` (the `claude-agent-acp` preset) it is sent on that
+  session, merged over `sessionMeta`, whatever `piTools` says, so the summary
+  cannot run the agent's own tools either. Agents without it get no `_meta`
+  on that session, not even `sessionMeta`. Cache-warming requests are answered without contacting the
   agent.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
   maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other
@@ -214,6 +228,22 @@ Global keys:
 - No ACP client capabilities (`fs`, `terminal`) are offered, so agents use
   their own file and terminal tools. Other agent→client requests get
   method-not-found.
+- Agents connected to Pi's MCP server over HTTP (`mcpTransport: "http"`, the
+  `claude-agent-acp` and `codex-acp` presets) are not told when Pi's tool
+  loadout changes (for example when an extension adds or removes a
+  tool). The server offers no server-to-client stream, so only stdio
+  connections get `notifications/tools/list_changed`. An HTTP agent sees the
+  new tools only when it lists them again, which an agent may do only once per
+  session. Start a new session with `/new` after changing the loadout. Calls
+  to a tool that is no longer served fail with "Pi has no tool named …".
+- Agents without an `ownToolsOffMeta` switch keep their built-in tools in
+  isolated summary requests. This includes Codex (`codex-acp`), which has no
+  documented ACP setting that turns them off.
+- A context window the agent reports does not change the running Pi
+  session: Pi reads the window from the selected model, which it replaces
+  only when a model is selected or the provider is registered. The reported
+  window applies after the next model list refresh (opening `/model`, or the
+  next startup), once the model is selected again or Pi reloads.
 - Of Pi's stream hooks, `onPayload` and `onProviderStreamEvent` are honored.
   `onResponse` is HTTP-specific and not called.
 

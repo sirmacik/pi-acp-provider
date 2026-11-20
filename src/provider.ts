@@ -85,6 +85,8 @@ import {
 export const ACP_PROVIDER_ID = "acp";
 const ACP_API = "acp";
 
+/** Until the agent reports its window in `usage_update.size`. */
+const DEFAULT_CONTEXT_WINDOW = 128_000;
 const PI_THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /** Agent values that also mean "off". */
 const OFF_ALIASES = ["off", "none", "disabled"];
@@ -119,7 +121,7 @@ function toModel(agentId: string, id: string, name: string, thinking: ThinkingLe
 		...(thinking ? { thinkingLevelMap: thinking } : {}),
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128_000,
+		contextWindow: DEFAULT_CONTEXT_WINDOW,
 		maxTokens: 16_384,
 	};
 }
@@ -330,6 +332,7 @@ interface PiCall {
 
 interface LiveTurn {
 	agent: AcpAgentConfig;
+	modelId: string;
 	acp: AcpClient;
 	sessionId: string;
 	controller: AbortController;
@@ -456,8 +459,18 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const agents = new Map(options.config.agents.map((agent) => [agent.id, agent]));
 	/** Each agent's models from discovery (or the persisted catalog); default model only until then. */
 	const discovered = new Map<string, Model<Api>[]>();
+	/** The context window each model's agent last reported in `usage_update.size`, by Pi model id. */
+	const reportedWindows = new Map<string, number>();
+	// WARN: Pi reads `contextWindow` from the selected model and replaces that only on model selection or
+	// provider registration, so a reported size takes effect when the catalogue is next published, not mid-session.
+	// A models.json `modelOverrides` entry still wins: Pi applies it on top of these models.
 	const buildModels = () =>
-		options.config.agents.flatMap((agent) => discovered.get(agent.id) ?? agentModels(agent));
+		options.config.agents.flatMap((agent) =>
+			(discovered.get(agent.id) ?? agentModels(agent)).map((model) => {
+				const reported = reportedWindows.get(model.id);
+				return reported === undefined || reported === model.contextWindow ? model : { ...model, contextWindow: reported };
+			}),
+		);
 	let models = buildModels();
 	let cwd = process.cwd();
 	/** One client (and agent process) per agent, spawned on first use. */
@@ -590,6 +603,19 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				if (sessionId === undefined) server?.revoke(nonce);
 				else nonceSessions.set(nonce, { agentId: agent.id, sessionId });
 			},
+		};
+	}
+
+	/**
+	 * `session/new` params for an isolated request: no Pi tools, and the agent's own tools off whenever it has
+	 * a switch for them, whatever `piTools` says, because a summary needs no tools (adr-002: fail closed).
+	 * WARN: agents without `ownToolsOffMeta` (Codex) get the bare params isolated sessions always had, without
+	 * `sessionMeta`, and keep their built-in tools; ACP has no generic switch.
+	 */
+	function isolatedSetup(agent: AcpAgentConfig): SessionSetup {
+		return {
+			key: "isolated",
+			params: () => (agent.ownToolsOffMeta ? { _meta: deepMerge(agent.sessionMeta ?? {}, agent.ownToolsOffMeta) } : {}),
 		};
 	}
 
@@ -755,6 +781,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 		const turn: LiveTurn = {
 			agent,
+			modelId: model.id,
 			acp,
 			sessionId,
 			controller: new AbortController(),
@@ -874,6 +901,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	function dispatch(turn: LiveTurn, event: TurnEvent): void {
 		if (event.type === "usage_update") {
 			turn.contextUsed = event.used;
+			if (event.size !== undefined) reportedWindows.set(turn.modelId, event.size);
 			return;
 		}
 		if (event.type === "tool_call" || event.type === "tool_call_update") {
@@ -1062,7 +1090,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const signal = streamOptions.signal;
 		const client = newClient(agent, cwd);
 		try {
-			const sessionId = await client.ensureSession({ signal });
+			const sessionId = await client.ensureSession({ signal, setup: isolatedSetup(agent) });
 			await applySettings(client, agent, sessionId, modelId, model, streamOptions);
 			const info = client.info ?? (await client.ensureReady(signal));
 			const blocks: AcpContentBlock[] = [];
@@ -1081,7 +1109,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				signal,
 				onUpdate: (update) => {
 					if (update.type === "agent_message_chunk") writer.append("text", update.text);
-					else if (update.type === "usage_update") contextUsed = update.used;
+					else if (update.type === "usage_update") {
+						contextUsed = update.used;
+						if (update.size !== undefined) reportedWindows.set(model.id, update.size);
+					}
 				},
 			});
 			if (result.kind === "aborted") writer.fail("aborted", "Request was aborted");
@@ -1172,9 +1203,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const restored = new Map<string, Model<Api>[]>();
 		for (const model of context.stored?.models ?? []) {
 			const owner = parseModelId(model.id, agents)?.agent.id;
-			if (!owner || discovered.has(owner)) continue;
+			if (!owner) continue;
+			const stored: unknown = "contextWindow" in model ? model.contextWindow : undefined;
+			const window = typeof stored === "number" && Number.isSafeInteger(stored) && stored > 0 ? stored : DEFAULT_CONTEXT_WINDOW;
+			// WHY: the persisted catalogue holds only windows this provider published, so a non-default one was
+			// reported by the agent earlier and must survive the rediscovery below, which starts from the default.
+			if (window !== DEFAULT_CONTEXT_WINDOW && !reportedWindows.has(model.id)) reportedWindows.set(model.id, window);
+			if (discovered.has(owner)) continue;
 			const list = restored.get(owner) ?? [];
-			list.push(model as Model<Api>);
+			list.push({ ...(model as Model<Api>), contextWindow: window });
 			restored.set(owner, list);
 		}
 		for (const [owner, list] of restored) discovered.set(owner, list);
