@@ -640,6 +640,24 @@ test("a user message a hook left out of an answered prompt reaches the next one 
 	assert.equal((await capture(handle, messages)).prompt, "ECHO four");
 });
 
+test("a history seed a hook removed from two answered prompts reaches the third once", async () => {
+	const handle = makeProvider([agent()]);
+	const stripSeed = (payload: Payload): void => {
+		payload.prompt.splice(0, payload.prompt.length, ...payload.prompt.filter((block) => !/<conversation-history>/.test(block.text ?? "")));
+	};
+	const messages: Message[] = [user("earlier question"), foreignReply("FOREIGN-REPLY"), user("ECHO one")];
+	for (const [index, next] of ["ECHO two", "ECHO three"].entries()) {
+		const stripped = await capture(handle, messages, undefined, stripSeed);
+		assert.equal(stripped.message.stopReason, "stop");
+		assert.equal(stripped.prompt, index === 0 ? "ECHO one" : "ECHO two");
+		messages.push(stripped.message, user(next));
+	}
+	const third = await capture(handle, messages);
+	assert.match(third.prompt, /^<conversation-history>[\s\S]*earlier question[\s\S]*FOREIGN-REPLY[\s\S]*<\/conversation-history>\nECHO three$/);
+	messages.push(third.message, user("ECHO four"));
+	assert.equal((await capture(handle, messages)).prompt, "ECHO four");
+});
+
 test("content an onPayload hook removes from the prompt is sent again with the next one", async () => {
 	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
 	const messages = await queueSteer(handle, "MAXTOKENS work");

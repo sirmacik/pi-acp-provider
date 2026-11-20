@@ -904,13 +904,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const unseen = history
 			.slice(anchorIndex + 1)
 			.filter((candidate) => !isOwn(state, candidate) && !isHeld(candidate) && !requestUsers.has(candidate as UserMessage));
+		/** How much of `history` the session holds once the prompt is accepted. */
+		let heldHistory = history.length;
 		const transcript = renderTranscript(unseen);
 		if (transcript) {
 			const intro = "Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:";
 			parts.push(
-				promptPart([tagged("conversation-history", transcript, intro)], () => {
-					for (const seen of unseen) state.seeded.add(messageKey(seen));
-				}),
+				promptPart(
+					[tagged("conversation-history", transcript, intro)],
+					() => {
+						for (const seen of unseen) state.seeded.add(messageKey(seen));
+					},
+					// WHY: the anchor must stay before history the session never got, or later prompts skip it.
+					{ omit: () => (heldHistory = history.indexOf(unseen[0]!)) },
+				),
 			);
 		}
 		if (late.length > 0) parts.push(promptPart([{ type: "text", text: LATE_STEER_NOTE }], () => {}));
@@ -955,7 +962,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		const commit = (): void => {
 			for (const part of parts) (sent.includes(part) ? part.record : part.omit)();
-			const newestOwn = history.findLast((candidate) => isOwnReply(state, candidate));
+			const newestOwn = history.slice(0, heldHistory).findLast((candidate) => isOwnReply(state, candidate));
 			if (newestOwn) state.anchor = newestOwn.timestamp;
 			state.first = messages[0] ? messageKey(messages[0]) : undefined;
 			state.ownStamps.add(message.timestamp);
