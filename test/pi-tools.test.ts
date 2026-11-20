@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Message, Model, Api, Tool } from "@earendil-works/pi-ai";
@@ -106,6 +108,21 @@ for (const transport of ["stdio", "http"] as const) {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Runs `body` with TMPDIR at `dir`, where Pi's MCP server makes its stdio socket directory.
+ * WARN: POSIX only; `os.tmpdir()` ignores TMPDIR on Windows, and the MCP server uses a named pipe there.
+ */
+async function withTmpdir<T>(dir: string, body: () => Promise<T>): Promise<T> {
+	const saved = process.env.TMPDIR;
+	process.env.TMPDIR = dir;
+	try {
+		return await body();
+	} finally {
+		if (saved === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = saved;
+	}
+}
+
 for (const [knob, label, call] of [
 	// The cancellation must have reached the provider, which rejects the call; not a call left pending.
 	["FAKE_MCP_CANCEL", "cancelled its MCP call", /CALL<<<The tool call was cancelled\.>>>/],
@@ -183,6 +200,74 @@ for (const transport of ["stdio", "http"] as const) {
 		assert.deepEqual(asked, []);
 	});
 }
+
+/** A provider whose permission policy records each request's title and allows it. */
+function recordingProvider(env: Record<string, string>, asked: string[], overrides: Partial<AcpAgentConfig> = {}) {
+	return makeProvider([agent({ env, ...overrides })], {
+		permissionPolicy: async (request) => {
+			asked.push(request.title);
+			return { outcome: "selected", optionId: "allow" };
+		},
+	});
+}
+
+/** Runs one MCPCALL turn that asks permission for its echo call; returns the final reply text. */
+async function askedEchoTurn(handle: AcpProviderHandle): Promise<string> {
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} ASKPERM')];
+	const first = await step(handle, messages);
+	assert.equal(first.stopReason, "toolUse");
+	messages.push(first, ...(await answerTools(handle, first)));
+	return textOf(await step(handle, messages));
+}
+
+for (const [label, env] of [
+	["the permission request's structured name", { FAKE_PERMISSION_NAME: "mcp__pi__echo" }],
+	["the structured name the tool call was reported with", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_TITLE: "Echo" }],
+] as const) {
+	test(`a live Pi tool call named by ${label} is approved without the policy`, async () => {
+		const asked: string[] = [];
+		const text = await askedEchoTurn(recordingProvider(env, asked));
+		assert.match(text, /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+		assert.deepEqual(asked, []);
+	});
+}
+
+for (const [label, env, title] of [
+	["titled only", {}, "mcp__pi__echo"],
+	["named for a tool Pi does not serve", { FAKE_PERMISSION_NAME: "mcp__pi__rm" }, "mcp__pi__echo"],
+	["named unlike its tool call", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_NAME: "Bash" }, "mcp__pi__echo"],
+] as const) {
+	test(`a permission request for a Pi tool call ${label} goes to the policy`, async () => {
+		const asked: string[] = [];
+		const text = await askedEchoTurn(recordingProvider(env, asked));
+		assert.match(text, /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+		assert.deepEqual(asked, [title]);
+	});
+}
+
+test("a Pi-looking permission request without a reported, pending tool call goes to the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_TITLE: "Read pi/notes.md", FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, { piTools: "both" });
+	const message = await step(handle, [user("PERMISSION")]);
+	assert.match(textOf(message), /\[approved=allow\]/);
+	assert.deepEqual(asked, ["Read pi/notes.md"]);
+});
+
+test("a Pi-named permission request on a session without Pi's MCP server goes to the policy", { skip: process.platform === "win32" }, async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked);
+	const message = await withTmpdir(join(tmpdir(), `missing-${process.pid}`), () => step(handle, [user('MCPCALL:echo:{"text":"hi"} ASKPERM')]));
+	assert.match(textOf(message), /NO-MCP-SERVER/);
+	assert.deepEqual(asked, ["mcp__pi__echo"]);
+});
+
+test("a Pi-named permission request from an isolated request goes to the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked);
+	const message = await step(handle, [user("PERMISSION summarize")], undefined, { cacheRetention: "none" });
+	assert.match(textOf(message), /\[approved=allow\]/);
+	assert.deepEqual(asked, ["rm -rf build"]);
+});
 
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_MCP_TITLE: "Run something" } })], { nativeTools: () => true });

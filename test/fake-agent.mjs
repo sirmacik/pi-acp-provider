@@ -2,7 +2,9 @@
  * Fake ACP (v1) agent for tests.
  *
  * Behavior is driven by markers in the prompt text and FAKE_* env vars:
- *   - "PERMISSION"  asks session/request_permission (string request id) first
+ *   - "PERMISSION"  asks session/request_permission (string request id) first, for tool call "t0"
+ *                   (never reported), titled FAKE_PERMISSION_TITLE (default "rm -rf build"), with
+ *                   ACP `name` FAKE_PERMISSION_NAME when set
  *   - "SLOW"        delays each streamed update (~150ms)
  *                   (a PERMISSION answer that arrives after session/cancel is reported by the next
  *                   ECHO as "CANCELLEDPERM<<<<optionId|outcome>>>>")
@@ -34,6 +36,10 @@
  *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
  *                   when a _session/steering message arrived meanwhile)
  *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
+ *   - FAKE_MCP_NAME=<n>  gives that tool call the structured ACP `name` <n>
+ *   - "ASKPERM"     with MCPCALL: after reporting the tool call, asks permission for it (titled
+ *                   FAKE_PERMISSION_TITLE or like the call, `name` FAKE_PERMISSION_NAME when set);
+ *                   the reply starts "PERM<<<optionId|outcome>>>" and the call is made only when allowed
  *   - FAKE_MCP_CANCEL=1  cancels that MCP call after 50ms (`notifications/cancelled`) and ends the
  *                   turn with "AGENT-WENT-ON CALL<<<what the call returned>>>"
  *   - FAKE_MCP_GIVEUP=1  ends the turn after 50ms without waiting for the call
@@ -283,6 +289,20 @@ function serverRequest(method, params) {
 	});
 }
 
+/** session/request_permission for `toolCallId`, shaped by FAKE_PERMISSION_TITLE and FAKE_PERMISSION_NAME. */
+function askPermission(sessionId, toolCallId, title) {
+	const name = process.env.FAKE_PERMISSION_NAME;
+	return serverRequest("session/request_permission", {
+		sessionId,
+		toolCall: { toolCallId, title: process.env.FAKE_PERMISSION_TITLE ?? title, ...(name ? { name } : {}) },
+		options: [
+			{ optionId: "allow", name: "Allow", kind: "allow_once" },
+			{ optionId: "allow-all", name: "Always allow", kind: "allow_always" },
+			{ optionId: "deny", name: "Deny", kind: "reject_once" },
+		],
+	});
+}
+
 async function handlePrompt(message) {
 	const { sessionId } = message.params;
 	await sendStaleTraffic();
@@ -342,8 +362,20 @@ async function handlePrompt(message) {
 	if (mcpMatch) {
 		const [, tool, json] = mcpMatch;
 		const args = JSON.parse(json);
-		update(sessionId, { sessionUpdate: "tool_call", toolCallId: "m1", title: process.env.FAKE_MCP_TITLE ?? `mcp__pi__${tool}`, status: "pending", rawInput: args });
+		const title = process.env.FAKE_MCP_TITLE ?? `mcp__pi__${tool}`;
+		const name = process.env.FAKE_MCP_NAME ? { name: process.env.FAKE_MCP_NAME } : {};
+		update(sessionId, { sessionUpdate: "tool_call", toolCallId: "m1", title, ...name, status: "pending", rawInput: args });
 		await sleep(20);
+		let perm = "";
+		if (text.includes("ASKPERM")) {
+			const answer = (await askPermission(sessionId, "m1", title)).result?.outcome ?? {};
+			const chosen = answer.outcome === "selected" ? answer.optionId : answer.outcome ?? "error";
+			perm = `PERM<<<${chosen}>>> `;
+			if (chosen !== "allow") {
+				update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: perm.trim() } });
+				return turn.finish("end_turn");
+			}
+		}
 		const server = (sessionParams.get(sessionId)?.mcpServers ?? []).find((entry) => entry.name === "pi");
 		if (!server) {
 			update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NO-MCP-SERVER" } });
@@ -372,7 +404,7 @@ async function handlePrompt(message) {
 		const extra = steered.length > 0 ? ` STEERED<<<${steered.splice(0).join("|")}>>>` : "";
 		update(sessionId, {
 			sessionUpdate: "agent_message_chunk",
-			content: { type: "text", text: `TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
+			content: { type: "text", text: `${perm}TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
 		});
 		promptCounter++;
 		return turn.finish("end_turn");
@@ -394,15 +426,7 @@ async function handlePrompt(message) {
 
 	let approved = null;
 	if (text.includes("PERMISSION")) {
-		const response = await serverRequest("session/request_permission", {
-			sessionId,
-			toolCall: { toolCallId: "t0", title: "rm -rf build" },
-			options: [
-				{ optionId: "allow", name: "Allow", kind: "allow_once" },
-				{ optionId: "allow-all", name: "Always allow", kind: "allow_always" },
-				{ optionId: "deny", name: "Deny", kind: "reject_once" },
-			],
-		});
+		const response = await askPermission(sessionId, "t0", "rm -rf build");
 		const outcome = response.result?.outcome ?? {};
 		approved = outcome.outcome === "selected" ? outcome.optionId : outcome.outcome ?? "error";
 		if (turn.cancelled) cancelledPermission = approved;
