@@ -33,7 +33,6 @@ const reply = (text: string, options: { provider?: string; stopReason?: StopReas
 
 const OWNER = "fake\u0000conversation";
 
-/** A prompt build with defaults for everything a test does not set. */
 function build(state: SyncState, messages: readonly Message[], overrides: Partial<PromptInput> = {}): PromptBuild {
 	const steers = overrides.steers ?? new PendingSteers();
 	const result = buildPromptBlocks({
@@ -43,7 +42,7 @@ function build(state: SyncState, messages: readonly Message[], overrides: Partia
 		messages,
 		held: steers.recover(OWNER, messages, state),
 		images: false,
-		timestamp: ++clock,
+		replyTimestamp: ++clock,
 		steers,
 		owner: OWNER,
 		...overrides,
@@ -54,7 +53,6 @@ function build(state: SyncState, messages: readonly Message[], overrides: Partia
 
 const texts = (prompt: PromptBuild): string[] => prompt.blocks.flatMap((block) => (block.type === "text" ? [block.text] : []));
 const acceptAll = (prompt: PromptBuild): void => prompt.commit(prompt.parts);
-/** Streams `answer` as the session's reply to the prompt, as `runTurn` and `attach` do. */
 function streamed(state: SyncState, prompt: PromptBuild, answer: AssistantMessage): void {
 	state.ownStamps.add(answer.timestamp);
 	acceptAll(prompt);
@@ -247,7 +245,7 @@ test("there is nothing to send when the only user is a dropped steer", () => {
 		messages: [steer],
 		held: steers.recover(OWNER, [steer], state),
 		images: false,
-		timestamp: ++clock,
+		replyTimestamp: ++clock,
 		steers,
 		owner: OWNER,
 	});

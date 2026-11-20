@@ -1,10 +1,3 @@
-/**
- * What an ACP session has seen of the Pi conversation, and the prompt that sends it the rest.
- *
- * Nothing here talks to an agent: `buildPromptBlocks` assembles a prompt from a snapshot, and its
- * `commit` records what the prompt delivered once the agent accepts it.
- */
-
 import type { AssistantMessage, Message, UserMessage } from "@earendil-works/pi-ai";
 import { isRecord } from "./acp.ts";
 import type { SystemPromptMode } from "./config.ts";
@@ -88,7 +81,6 @@ function requestStart(messages: readonly Message[]): number {
 	return 0;
 }
 
-/** The user messages of the request Pi makes. */
 export function requestUsers(messages: readonly Message[]): UserMessage[] {
 	return messages.slice(requestStart(messages)).filter((candidate): candidate is UserMessage => candidate.role === "user");
 }
@@ -249,21 +241,16 @@ export function partsIn(parts: readonly PromptPart[], payload: unknown): PromptP
 }
 
 export interface PromptInput {
-	/** The agent's `systemPrompt` setting. */
 	systemPromptMode: SystemPromptMode;
-	/** Pi's current system prompt. */
 	systemPrompt: string;
 	state: SyncState;
-	/** Pi's conversation (`conversation(context.messages)`). */
+	/** WARN: system messages must be filtered out (`conversation`): they would move the first-message key and the tail. */
 	messages: readonly Message[];
-	/** The pending steers `PendingSteers.recover` returned for this request. */
+	/** WARN: must be what `steers.recover` returned for these `messages`, or off-branch or delivered steers are sent. */
 	held: readonly PendingSteer[];
-	/** Whether the agent takes image blocks. */
 	images: boolean;
-	/** Timestamp of the Pi message the prompt streams into. */
-	timestamp: number;
+	replyTimestamp: number;
 	steers: PendingSteers;
-	/** The `PendingSteers` owner of the request. */
 	owner: string;
 }
 
@@ -271,19 +258,14 @@ export interface PromptBuild {
 	parts: PromptPart[];
 	blocks: AcpContentBlock[];
 	/**
-	 * Records what the prompt delivered, given the parts the sent payload carried (`partsIn`).
-	 * WARN: call it only once the agent accepts the prompt; until then nothing here has changed any state.
+	 * WARN: run it only once the agent accepts the prompt, with the parts `partsIn` found in the sent
+	 * payload; until then the build has changed no state, so a rejected prompt is retried in full.
 	 */
 	commit: (sent: readonly PromptPart[]) => void;
 }
 
-/**
- * The prompt that brings the session up to date with Pi's conversation: changed system instructions, a
- * `<conversation-history>` seed of what it has not seen, late steers, then the request's new users.
- * Null when there is no user message left to send.
- */
 export function buildPromptBlocks(input: PromptInput): PromptBuild | null {
-	const { systemPromptMode, systemPrompt, state, messages, held, images, timestamp, steers, owner } = input;
+	const { systemPromptMode, systemPrompt, state, messages, held, images, replyTimestamp, steers, owner } = input;
 	const tail = messages.slice(tailStart(messages));
 	const users = requestUsers(messages);
 	const parts: PromptPart[] = [];
@@ -341,7 +323,7 @@ export function buildPromptBlocks(input: PromptInput): PromptBuild | null {
 		const newestOwn = history.slice(0, heldHistory).findLast((candidate) => isOwnReply(state, candidate));
 		if (newestOwn) state.anchor = newestOwn.timestamp;
 		state.first = messages[0] ? messageKey(messages[0]) : undefined;
-		state.ownStamps.add(timestamp);
+		state.ownStamps.add(replyTimestamp);
 	};
 	return { parts, blocks: parts.flatMap((part) => part.blocks), commit };
 }

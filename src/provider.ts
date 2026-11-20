@@ -201,7 +201,6 @@ const turnKey = (agentId: string, id: string): string => `${agentId}\u0000${id}`
 interface SessionRequest {
 	agent: AcpAgentConfig;
 	acp: AcpClient;
-	/** The conversation's `LiveTurn.key`. */
 	key: string;
 	conversationId: string;
 	modelId: string | undefined;
@@ -356,7 +355,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * becomes the turn's `controller`. Aborting it supersedes the request, set up or not.
 	 */
 	const claims = new Map<string, AbortController>();
-	/** Pending steers by `LiveTurn.key`. */
 	const pendingSteers = new PendingSteers();
 	// WARN: session ids repeat once an agent respawns, and a turn parked at a Pi tool call outlives its
 	// process; routing and sync lookups must match the session instance, never the id alone.
@@ -564,11 +562,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 	}
 
-	/**
-	 * The ACP session for the conversation `key`, with Pi's tool wiring and settings applied, and what it
-	 * has seen; a session that lacks the wiring, or whose history Pi no longer holds, is replaced.
-	 * Throws on any setup failure (spawn, handshake, session) or once `request.signal` aborts.
-	 */
 	async function openSession(request: SessionRequest): Promise<OpenedSession> {
 		const { agent, acp, key, conversationId, modelId, model, streamOptions, messages, systemPrompt, signal } = request;
 		const server = await mcpServer(agent);
@@ -602,7 +595,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return { sessionId, instance, state, info };
 	}
 
-	/** Forwards the agent's raw `session/update` params to Pi's `onProviderStreamEvent`, if it has one. */
 	function rawUpdateHook(streamOptions: StreamOptions | undefined, model: Model<Api>): ((params: unknown) => void) | undefined {
 		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
 		return (
@@ -685,7 +677,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 
 		const systemPrompt = getCurrentSystemPrompt(context.messages);
-		// Setup failures end the stream before `start`.
 		let opened: OpenedSession;
 		try {
 			opened = await openSession({ agent, acp, key, conversationId, modelId: target.modelId, model, streamOptions, messages, systemPrompt, signal: setupSignal });
@@ -705,7 +696,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			messages,
 			held: pendingSteers.recover(key, messages, state),
 			images: info.capabilities.image,
-			timestamp: message.timestamp,
+			replyTimestamp: message.timestamp,
 			steers: pendingSteers,
 			owner: key,
 		});
