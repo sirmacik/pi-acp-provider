@@ -66,6 +66,11 @@ export interface PromptRequest {
 	onUpdate: (update: AcpSessionUpdate) => void;
 	/** Observes raw `session/update` params of this session before parsing. */
 	onRawUpdate?: ((params: unknown) => void) | undefined;
+	/**
+	 * Called once `session/prompt` is written, after any cancelled prompt of the session has
+	 * drained: from here on, the session's traffic belongs to this prompt.
+	 */
+	onSent?: (() => void) | undefined;
 	signal?: AbortSignal | undefined;
 }
 
@@ -155,14 +160,14 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 	});
 }
 
-/** Resolves when `promise` settles or after `ms`, whichever comes first. */
-function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+/** Resolves true when `promise` settles, or false after `ms`, whichever comes first. */
+function settleWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
 	return new Promise((resolve) => {
-		const timer = setTimeout(resolve, ms);
+		const timer = setTimeout(() => resolve(false), ms);
 		timer.unref();
 		const done = () => {
 			clearTimeout(timer);
-			resolve();
+			resolve(true);
 		};
 		promise.then(done, done);
 	});
@@ -224,9 +229,16 @@ export class AcpClient {
 	private disposed = false;
 	private nextId = 1;
 	private readonly pending = new Map<RpcId, PendingRequest>();
-	private turn: PromptRequest | null = null;
-	/** Settles once a cancelled turn's `session/prompt` response has arrived. */
-	private draining: Promise<void> = Promise.resolve();
+	/** Sessions with a `prompt` call in progress, including its wait for a drain. */
+	private readonly busy = new Set<string>();
+	/**
+	 * The prompt each session's updates and permission requests belong to. Set only once the
+	 * prompt is sent: ACP updates carry no prompt id, so this is what keeps a cancelled prompt's
+	 * late traffic out of the next one.
+	 */
+	private readonly turns = new Map<string, PromptRequest>();
+	/** Cancelled prompts whose `cancelled` response has not arrived yet, by session id. */
+	private readonly drains = new Map<string, Promise<boolean>>();
 
 	constructor(options: AcpClientOptions) {
 		this.options = options;
@@ -340,14 +352,16 @@ export class AcpClient {
 
 	/** Sends one `session/prompt` and resolves when the turn finishes or is aborted. */
 	async prompt(request: PromptRequest): Promise<PromptResult> {
-		if (this.turn) throw new Error(`Another ${this.options.agent.name} prompt is already in flight`);
 		const { sessionId, signal } = request;
-		this.turn = request;
+		if (this.busy.has(sessionId)) throw new Error(`Another ${this.options.agent.name} prompt is already in flight`);
+		this.busy.add(sessionId);
 		if (this.conn) this.conn.sessionUsed = true;
 		try {
-			await this.draining;
+			await this.drained(sessionId);
 			if (signal?.aborted) return { kind: "aborted" };
+			this.turns.set(sessionId, request);
 			const response = this.request("session/prompt", request.payload);
+			request.onSent?.();
 			const finished = response.then((result): PromptResult => ({
 				kind: "finished",
 				stopReason: parseStopReason(result),
@@ -359,15 +373,26 @@ export class AcpClient {
 					// Resolve now so the UI unblocks; the agent replies `cancelled`
 					// later, and the next prompt waits for that (bounded).
 					this.notify("session/cancel", { sessionId });
-					this.draining = settleWithin(response, CANCEL_GRACE_MS);
+					if (this.turns.get(sessionId) === request) this.turns.delete(sessionId);
+					const drain = settleWithin(response, CANCEL_GRACE_MS);
+					this.drains.set(sessionId, drain);
+					void drain.then(() => {
+						if (this.drains.get(sessionId) === drain) this.drains.delete(sessionId);
+					});
 					resolve({ kind: "aborted" });
 				};
 				signal.addEventListener("abort", onAbort, { once: true });
 				finished.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
 			});
 		} finally {
-			if (this.turn === request) this.turn = null;
+			this.busy.delete(sessionId);
+			if (this.turns.get(sessionId) === request) this.turns.delete(sessionId);
 		}
+	}
+
+	/** Waits for the session's cancelled prompt, if any, to answer (bounded by the cancel grace). */
+	private async drained(sessionId: string): Promise<void> {
+		await this.drains.get(sessionId);
 	}
 
 	/** Kills the agent permanently; the client cannot be reused. */
@@ -481,7 +506,7 @@ export class AcpClient {
 		this.log(`closing connection: ${reason.message}`);
 		this.conn = null;
 		this.ready = null;
-		this.draining = Promise.resolve();
+		this.drains.clear();
 		for (const entry of [...this.pending.values()]) entry.reject(reason);
 		terminate(conn.proc);
 	}
@@ -564,16 +589,24 @@ export class AcpClient {
 			const commands = parseAvailableCommands(params);
 			if (commands) conn.commands.set(sessionId, commands);
 		}
-		const turn = this.turn;
-		if (!turn || sessionId !== turn.sessionId) return;
+		const turn = this.turns.get(sessionId);
+		if (!turn) return;
 		turn.onRawUpdate?.(params);
 		const update = parseSessionUpdate(params);
 		if (update) turn.onUpdate(update);
 	}
 
 	private async answerServerRequest(id: RpcId, method: string, params: unknown): Promise<void> {
+		const sessionId = isRecord(params) && typeof params.sessionId === "string" ? params.sessionId : undefined;
+		// WHY: a cancelled prompt must answer its permission requests `cancelled`; while it drains,
+		// the session has no current prompt whose signal could say so.
+		if (method === "session/request_permission" && sessionId !== undefined && this.drains.has(sessionId)) {
+			this.write({ jsonrpc: "2.0", id, result: { outcome: { outcome: "cancelled" } } });
+			return;
+		}
 		try {
-			const result = await this.options.onServerRequest({ method, params, signal: this.turn?.signal });
+			const turn = sessionId === undefined ? undefined : this.turns.get(sessionId);
+			const result = await this.options.onServerRequest({ method, params, signal: turn?.signal });
 			this.write({ jsonrpc: "2.0", id, result: result ?? null });
 		} catch (error) {
 			this.write({

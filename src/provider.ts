@@ -339,6 +339,11 @@ interface LiveTurn {
 	outcome: TurnOutcome | null;
 	/** Whether a `session/prompt` of this turn is in flight. */
 	running: boolean;
+	/**
+	 * Whether the session's traffic belongs to this turn: false until its first prompt is sent,
+	 * because until then the session may still be draining a cancelled prompt.
+	 */
+	accepting: boolean;
 	/** Prompts to send, in order, once the running one ends (steering the agent could not take mid-turn). */
 	queued: AcpContentBlock[][];
 	tools: Map<string, ToolEntry>;
@@ -730,6 +735,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			attached: null,
 			outcome: null,
 			running: false,
+			accepting: false,
 			queued: [],
 			tools: new Map(),
 			piCalls: new Map(),
@@ -826,6 +832,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				payload,
 				signal: turn.controller.signal,
 				onRawUpdate: turn.onRawUpdate,
+				onSent: () => (turn.accepting = true),
 				onUpdate: (update) => dispatch(turn, update),
 			})
 			.then(
@@ -876,7 +883,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/** An MCP `tools/call` from the agent: becomes a Pi tool call in the running turn. */
 	function handleMcpCall(call: McpCall): Promise<McpCallResult> {
 		const turn = live;
-		if (!turn || turn.agent.id !== call.agentId || turn.outcome || turn.controller.signal.aborted) {
+		if (!turn || turn.agent.id !== call.agentId || !turn.accepting || turn.outcome || turn.controller.signal.aborted) {
 			return Promise.reject(new Error("Pi is not running a turn for this agent, so its tools are unavailable."));
 		}
 		if (!(served.get(call.agentId) ?? []).some((tool) => tool.name === call.name)) {

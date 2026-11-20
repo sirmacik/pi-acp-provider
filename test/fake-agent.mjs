@@ -34,6 +34,9 @@
  *   - FAKE_MCP_CANCEL=1  cancels that MCP call after 50ms (`notifications/cancelled`) and ends the
  *                   turn with "AGENT-WENT-ON CALL<<<what the call returned>>>"
  *   - FAKE_MCP_GIVEUP=1  ends the turn after 50ms without waiting for the call
+ *   - FAKE_CANCEL_LAG=<ms>  after session/cancel, sends a chunk "LATE-CHUNK", a permission
+ *                   request and an MCP echo call, waits <ms>, then answers `cancelled`; the next
+ *                   ECHO adds "LAG<<<permission=<outcome>;mcp=<rejected|accepted:...|none>>>>"
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
  *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
  *   - FAKE_STEERING=1    advertises and accepts `_session/steering`
@@ -96,7 +99,10 @@ let sessionCounter = 0;
 let promptCounter = 0;
 let serverRequestId = 0;
 const serverRequestWaiters = new Map();
-let activePrompt = null;
+/** The running prompt of each session. */
+const activePrompts = new Map();
+/** What the fake saw of a cancelled turn's late traffic (FAKE_CANCEL_LAG), reported by the next ECHO. */
+let lagReport = null;
 const sessionParams = new Map();
 const steered = [];
 
@@ -184,6 +190,32 @@ const callText = (response) =>
 		? `error:${response.error.message}`
 		: (response.result.content ?? []).map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("|");
 
+const CANCEL_LAG = Number(process.env.FAKE_CANCEL_LAG ?? 0);
+
+/** FAKE_CANCEL_LAG: after session/cancel, a chunk, a permission request and an MCP call, then `cancelled`. */
+async function lagThenCancel(turn) {
+	const { sessionId } = turn;
+	await sleep(10);
+	update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "LATE-CHUNK" } });
+	const response = await serverRequest("session/request_permission", {
+		sessionId,
+		toolCall: { toolCallId: "late", title: "late tool" },
+		options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+	});
+	const permission = response.result?.outcome?.outcome ?? "error";
+	let mcp = "none";
+	const server = (sessionParams.get(sessionId)?.mcpServers ?? []).find((entry) => entry.name === "pi");
+	if (server) {
+		const { client, result } = await startMcpCall(server, "echo", { text: "late" });
+		const call = await result;
+		client.close();
+		mcp = call.error || call.result.isError ? "rejected" : `accepted:${callText(call)}`;
+	}
+	lagReport = `permission=${permission};mcp=${mcp}`;
+	await sleep(CANCEL_LAG);
+	turn.finish("cancelled");
+}
+
 function serverRequest(method, params) {
 	return new Promise((resolve) => {
 		const id = `srv-${++serverRequestId}`;
@@ -196,14 +228,17 @@ async function handlePrompt(message) {
 	const { sessionId } = message.params;
 	const text = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
 	const turn = {
+		sessionId,
 		finished: false,
+		/** Set by session/cancel: the turn stops its scripted steps. */
+		cancelled: false,
 		finish(stopReason) {
 			if (this.finished) return;
 			this.finished = true;
 			reply(message.id, { stopReason });
 		},
 	};
-	activePrompt = turn;
+	activePrompts.set(sessionId, turn);
 	const stepDelay = text.includes("SLOW") ? 150 : 5;
 
 	if (text.includes("LONGLOOP")) {
@@ -227,7 +262,8 @@ async function handlePrompt(message) {
 		return turn.finish("end_turn");
 	}
 	if (text.includes("ECHO")) {
-		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>` } });
+		const lag = lagReport === null ? "" : ` LAG<<<${lagReport}>>>`;
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ECHO[${sessionId}]<<<${text}>>>${lag}` } });
 		promptCounter++;
 		return turn.finish("end_turn");
 	}
@@ -290,7 +326,7 @@ async function handlePrompt(message) {
 		});
 		const outcome = response.result?.outcome ?? {};
 		approved = outcome.outcome === "selected" ? outcome.optionId : outcome.outcome ?? "error";
-		if (turn.finished) return;
+		if (turn.finished || turn.cancelled) return;
 	}
 
 	const steps = [
@@ -331,7 +367,7 @@ async function handlePrompt(message) {
 		);
 	}
 	for (const step of steps) {
-		if (turn.finished) return;
+		if (turn.finished || turn.cancelled) return;
 		update(sessionId, step);
 		if (step.status === "completed" && text.includes("CRASH")) process.exit(3);
 		await sleep(stepDelay);
@@ -417,15 +453,21 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 				break;
 			}
 			const steerText = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
-			if (activePrompt && !activePrompt.finished) {
+			const running = activePrompts.get(message.params.sessionId);
+			if (running && !running.finished) {
 				steered.push(steerText);
 				reply(message.id, { outcome: "steered" });
 			} else reply(message.id, { outcome: "promptRequired", reason: "noRunningTurn" });
 			break;
 		}
-		case "session/cancel":
-			activePrompt?.finish("cancelled");
+		case "session/cancel": {
+			const running = activePrompts.get(message.params?.sessionId);
+			if (!running || running.finished) break;
+			running.cancelled = true;
+			if (CANCEL_LAG > 0) void lagThenCancel(running);
+			else running.finish("cancelled");
 			break;
+		}
 		default:
 			if (message.id !== undefined) replyError(message.id, -32601, `Method not found: ${message.method}`);
 	}

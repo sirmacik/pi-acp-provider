@@ -124,6 +124,37 @@ for (const [knob, label] of [
 	});
 }
 
+/** Streams `messages` and aborts on the first thinking delta; returns the aborted message. */
+async function abortedStep(handle: AcpProviderHandle, messages: Message[]): Promise<AssistantMessage> {
+	const controller = new AbortController();
+	const context = normalizeContext({ tools: [echoTool], messages });
+	let last: AssistantMessageEvent | undefined;
+	for await (const event of handle.provider.streamSimple(model(handle), context, { signal: controller.signal })) {
+		last = event;
+		if (event.type === "thinking_delta") controller.abort();
+	}
+	assert.ok(last?.type === "error" && last.reason === "aborted", `expected aborted, got ${JSON.stringify(last)}`);
+	return last.error;
+}
+
+test("a cancelled prompt's late updates, permission requests and MCP calls stay out of the next turn", async () => {
+	const asked: string[] = [];
+	const handle = makeProvider([agent({ env: { FAKE_CANCEL_LAG: "200" } })], {
+		permissionPolicy: async (request) => {
+			asked.push(request.title);
+			return { outcome: "selected", optionId: "allow" };
+		},
+	});
+	const messages: Message[] = [user("SLOW work")];
+	messages.push(await abortedStep(handle, messages), user("ECHO next"));
+	const next = await step(handle, messages);
+	assert.equal(next.stopReason, "stop");
+	const text = textOf(next);
+	assert.doesNotMatch(text, /LATE-CHUNK/);
+	assert.match(text, /LAG<<<permission=cancelled;mcp=rejected>>>/);
+	assert.deepEqual(asked, []);
+});
+
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_MCP_TITLE: "Run something" } })], { nativeTools: () => true });
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
