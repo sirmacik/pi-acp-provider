@@ -689,6 +689,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		let opened: OpenedSession;
 		try {
 			opened = await openSession({ agent, acp, key, conversationId, modelId: target.modelId, model, streamOptions, messages, systemPrompt, signal: setupSignal });
+			// WHY: the request can be superseded while this await resumes, after openSession's own check; it
+			// must then end before it prunes pending steers or starts the stream.
+			setupSignal.throwIfAborted();
 		} catch (error) {
 			abortedOrError(error);
 			return;
