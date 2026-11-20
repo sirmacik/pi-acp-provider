@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { request as httpRequest, type IncomingMessage } from "node:http";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { connect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { PiMcpServer, type McpCall, type PiMcpServerOptions } from "../src/mcp-server.ts";
 
@@ -447,4 +450,32 @@ test("stdio MCP refuses a wrong nonce and closes a connection once its nonce is 
 	server.revoke(nonce);
 	await good.closed;
 	assert.ok(good.socket.destroyed);
+});
+
+const serverHandles = () => process.getActiveResourcesInfo().filter((name) => name === "TCPServerWrap" || name === "PipeServerWrap").length;
+
+test("disposing a pending start rejects it and leaves no listener or socket directory", { skip: process.platform === "win32" }, async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-acp-dispose-"));
+	const saved = process.env.TMPDIR;
+	process.env.TMPDIR = dir;
+	try {
+		// WHY: an earlier test's disposed servers may still be closing.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const before = serverHandles();
+		const server = new PiMcpServer({ tools: () => [], call: async () => ({ content: [] }) });
+		const starting = server.start();
+		server.dispose();
+		const outcome = await Promise.race([
+			starting.then(() => "started", (error: unknown) => (error instanceof Error ? error.message : String(error))),
+			new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 2000)),
+		]);
+		assert.match(outcome, /disposed while starting/);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(serverHandles(), before, "no transport is left listening");
+		assert.deepEqual(readdirSync(dir), [], "no socket directory is left behind");
+	} finally {
+		if (saved === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = saved;
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

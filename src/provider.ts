@@ -60,6 +60,7 @@ import {
 	autoApprove,
 	isRecord,
 	parsePermissionRequest,
+	structuredToolIdentities,
 	type AcpAgentInfo,
 	type AcpCommand,
 	type AcpPermissionOutcome,
@@ -97,6 +98,8 @@ const OFF_ALIASES = ["off", "none", "disabled"];
  * Antigravity `mcp_pi_read` (titled "Run mcp_pi_read"), and `pi/read`.
  */
 const PI_TOOL_REF = new RegExp(`(?:^|[\\s:(\\[])(?:mcp(?:__|[._])${PI_MCP_SERVER}(?:__|[._/])|${PI_MCP_SERVER}/)([\\w-]+)`);
+/** A whole structured tool name (never a title) for a tool of Pi's MCP server, in the namings above. */
+const PI_TOOL_NAME = new RegExp(`^(?:mcp(?:__|[._])${PI_MCP_SERVER}(?:__|[._/])|${PI_MCP_SERVER}/)(.+)$`);
 
 /**
  * Maps Pi thinking levels onto the agent's `thought_level` values by name
@@ -317,6 +320,10 @@ interface ToolEntry {
 	/** The mirror tool's arguments, fixed by the first update so the tool row does not change. */
 	args: AcpToolArgs | undefined;
 	rawInput: unknown;
+	/** Every structured identity the agent's reports of this call carried (`structuredToolIdentities`), never the title. */
+	identities: unknown[];
+	/** The status the agent last reported; `state.status` can also be set by Pi's handoff of a call it runs. */
+	reportedStatus: AcpToolState["status"];
 	/** Whether a Pi message already shows this call as a tool row. */
 	mirrored: boolean;
 	/** A call to Pi's MCP server: Pi shows and runs it as its own tool call, so it is not mirrored. */
@@ -484,12 +491,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const nonceSessions = new Map<string, { agentId: string; sessionId: string }>();
 	/** The MCP nonce minted for each `session/new` params object, until the session is bound or fails. */
 	const mintedNonces = new WeakMap<Record<string, unknown>, string>();
+	/** The `SessionSetup.key` (Pi tool wiring) each main-client session was opened with, by client and session id. */
+	const sessionWiring = new WeakMap<AcpClient, Map<string, string>>();
+	const wiringOf = (client: AcpClient): Map<string, string> => {
+		let wiring = sessionWiring.get(client);
+		if (!wiring) sessionWiring.set(client, (wiring = new Map()));
+		return wiring;
+	};
 	/** The ACP turn in progress; it spans several Pi messages. */
 	let live: LiveTurn | null = null;
 
 	const answerServerRequest = async (
 		agent: AcpAgentConfig,
-		{ method, params, signal }: ServerRequest,
+		client: AcpClient,
+		{ method, params, sessionId, signal }: ServerRequest,
 	): Promise<unknown> => {
 		if (method !== "session/request_permission") {
 			throw new AcpRpcError(`pi-acp-provider does not support '${method}'`, RPC_METHOD_NOT_FOUND);
@@ -499,24 +514,54 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		// A cancelled turn must answer every pending permission request with `cancelled`.
 		if (signal?.aborted) return { outcome: { outcome: "cancelled" } };
 		// Pi's own tools pass Pi's approval when Pi runs them, so the agent's check is redundant.
-		if (isPiToolPermission(params)) return { outcome: autoApprove(request) };
+		if (isPiToolPermission(agent, client, sessionId, params)) return { outcome: autoApprove(request) };
 		const outcome = await policy(request, { agent, signal });
 		return { outcome: signal?.aborted ? { outcome: "cancelled" } : outcome };
 	};
 
-	function isPiToolPermission(params: unknown): boolean {
+	/**
+	 * Whether a permission request is for a call of Pi's own tool, judged by structure only (adr-001): it
+	 * comes from the main client on the live turn's session, which holds a bound MCP nonce, and names a
+	 * tool call the agent reported and has not reported finished; every structured identity of the request
+	 * and of the call's reports names one and the same tool Pi serves.
+	 * WARN: titles, `piOwned`, `mirrored` and `state` are display state an agent or a tool's input can steer;
+	 * never use them here.
+	 */
+	function isPiToolPermission(agent: AcpAgentConfig, client: AcpClient, sessionId: string | undefined, params: unknown): boolean {
+		const turn = live;
+		if (
+			!turn ||
+			turn.acp !== client ||
+			turn.agent.id !== agent.id ||
+			sessionId !== turn.sessionId ||
+			!turn.accepting ||
+			turn.outcome ||
+			turn.controller.signal.aborted
+		) {
+			return false;
+		}
+		if (![...nonceSessions.values()].some((owner) => owner.agentId === agent.id && owner.sessionId === sessionId)) return false;
 		const toolCall = isRecord(params) && isRecord(params.toolCall) ? params.toolCall : undefined;
-		if (!toolCall) return false;
-		const id = typeof toolCall.toolCallId === "string" ? toolCall.toolCallId : undefined;
-		if (id && live?.tools.get(id)?.piOwned) return true;
-		const meta = isRecord(toolCall._meta) && isRecord(toolCall._meta.claudeCode) ? toolCall._meta.claudeCode : undefined;
-		const toolName = typeof toolCall.name === "string" ? toolCall.name : typeof meta?.toolName === "string" ? meta.toolName : undefined;
-		return piToolRef(toolName, typeof toolCall.title === "string" ? toolCall.title : undefined) !== undefined;
+		const id = typeof toolCall?.toolCallId === "string" ? toolCall.toolCallId : undefined;
+		const entry = id === undefined ? undefined : turn.tools.get(id);
+		if (!toolCall || !entry || entry.reportedStatus === "completed" || entry.reportedStatus === "failed") return false;
+		const tools = new Set(
+			[...structuredToolIdentities(toolCall), ...entry.identities].map((identity) =>
+				typeof identity === "string" ? (PI_TOOL_NAME.exec(identity)?.[1] ?? null) : null,
+			),
+		);
+		const [tool, ...others] = tools;
+		return (
+			typeof tool === "string" &&
+			others.length === 0 &&
+			(served.get(agent.id) ?? []).some((candidate) => candidate.name === tool)
+		);
 	}
 
 	/** Forgets an ended session of `agent`'s main client and revokes its MCP nonces. */
-	function endSession(agent: AcpAgentConfig, sessionId: string): void {
+	function endSession(agent: AcpAgentConfig, client: AcpClient, sessionId: string): void {
 		sync.delete(sessionId);
+		wiringOf(client).delete(sessionId);
 		for (const [nonce, owner] of nonceSessions) {
 			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
 			nonceSessions.delete(nonce);
@@ -524,36 +569,54 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
-	const newClient = (agent: AcpAgentConfig, clientCwd: string, onSessionEnd?: (sessionId: string) => void): AcpClient =>
-		new AcpClient({
+	const newClient = (
+		agent: AcpAgentConfig,
+		clientCwd: string,
+		onSessionEnd?: (client: AcpClient, sessionId: string) => void,
+	): AcpClient => {
+		const client: AcpClient = new AcpClient({
 			agent,
 			cwd: clientCwd,
 			handshakeTimeoutMs: options.config.handshakeTimeoutMs,
 			cancelGraceMs: options.cancelGraceMs,
-			onServerRequest: (request) => answerServerRequest(agent, request),
-			onSessionEnd,
+			onServerRequest: (request) => answerServerRequest(agent, client, request),
+			onSessionEnd: onSessionEnd && ((sessionId) => onSessionEnd(client, sessionId)),
 			log: log && ((message) => log(`${agent.id}: ${message}`)),
 		});
+		return client;
+	};
 
 	const getClient = (agent: AcpAgentConfig): AcpClient => {
 		let client = clients.get(agent.id);
 		if (!client) {
 			// WARN: only the main client reports ended sessions: session ids are unique per process at
 			// best, so an isolated client's ended session could share an id with a live main one.
-			client = newClient(agent, cwd, (sessionId) => endSession(agent, sessionId));
+			client = newClient(agent, cwd, (owner, sessionId) => endSession(agent, owner, sessionId));
 			clients.set(agent.id, client);
 		}
 		return client;
 	};
 
-	/** Starts Pi's MCP server once; null (Pi's tools are not offered) when it cannot start. */
-	async function mcpServer(): Promise<PiMcpServer | null> {
+	/**
+	 * Pi's MCP server for `agent`'s next session, started on first use; null when the agent does not take
+	 * Pi's tools, or when the server cannot start and the agent may go on with its own (`piTools: "both"`).
+	 * A failed start is retried on the next turn.
+	 * WARN: a `piTools: "pi"` agent throws instead (adr-002): its own tools are switched off in favour of
+	 * Pi's, and starting it without them would fall back to built-ins Pi neither approves nor shows.
+	 */
+	async function mcpServer(agent: AcpAgentConfig): Promise<PiMcpServer | null> {
+		if (agent.piTools === "off") return null;
 		mcp ??= new PiMcpServer({ tools: (agentId) => served.get(agentId) ?? [], call: handleMcpCall, log });
 		try {
 			await mcp.start();
 			return mcp;
 		} catch (error) {
 			log?.(`Pi's MCP server failed to start: ${errorMessage(error)}`);
+			if (agent.piTools === "pi") {
+				throw new Error(
+					`Pi's tool server (MCP server "${PI_MCP_SERVER}") failed to start: ${errorMessage(error)}. ${agent.name} works with Pi's tools only, so this turn stops instead of using its built-in tools. Send the message again to retry.`,
+				);
+			}
 			return null;
 		}
 	}
@@ -573,9 +636,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	/** `session/new` params for Pi's tools and system prompt, chosen from what the agent advertises. */
-	function sessionSetup(agent: AcpAgentConfig, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
+	function sessionSetup(agent: AcpAgentConfig, client: AcpClient, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
+		const key = `pi:mcp=${server && agent.piTools !== "off" ? agent.mcpTransport : "none"}`;
 		return {
-			key: "pi",
+			key,
 			params: (info) => {
 				const params: Record<string, unknown> = {};
 				const piOnly = agent.piTools === "pi" && agent.ownToolsOffMeta !== undefined;
@@ -597,6 +661,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				return params;
 			},
 			settled: (params, sessionId) => {
+				if (sessionId !== undefined) wiringOf(client).set(sessionId, key);
 				const nonce = mintedNonces.get(params);
 				if (nonce === undefined) return;
 				mintedNonces.delete(params);
@@ -696,14 +761,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		let state: SyncState;
 		let info: AcpAgentInfo;
 		try {
-			const server = agent.piTools === "off" ? null : await mcpServer();
+			const server = await mcpServer(agent);
 			let promptInSession = false;
-			const setup = sessionSetup(agent, server, systemPrompt, () => (promptInSession = true));
+			const setup = sessionSetup(agent, acp, server, systemPrompt, () => (promptInSession = true));
 			sessionId = await acp.ensureSession({ signal, setup });
 			let known = sync.get(sessionId);
-			if (known && diverged(known, messages)) {
-				// The Pi branch changed under the session: start over from Pi's history.
-				log?.(`${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`);
+			// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
+			// down would never gain Pi's tools; a new session seeded from Pi's history does.
+			const rewired = wiringOf(acp).get(sessionId) !== setup.key;
+			if (rewired || (known && diverged(known, messages))) {
+				log?.(
+					rewired
+						? `${agent.id}: session ${sessionId} lacks Pi's tool wiring (${setup.key}); starting a new session`
+						: `${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`,
+				);
 				sync.delete(sessionId);
 				acp.resetSession(cwd);
 				promptInSession = false;
@@ -911,6 +982,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					title: undefined,
 					args: undefined,
 					rawInput: undefined,
+					identities: [],
+					reportedStatus: undefined,
 					mirrored: false,
 					piOwned: false,
 					state: { status: undefined, content: { text: [], diffs: [], terminals: [] }, rawOutput: undefined },
@@ -919,10 +992,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				turn.tools.set(event.toolCallId, entry);
 			}
 			if (event.title) entry.title = event.title;
-			if (event.status) entry.state.status = event.status;
+			if (event.status) entry.state.status = entry.reportedStatus = event.status;
 			if (event.content) entry.state.content = event.content;
 			if (event.rawOutput !== undefined) entry.state.rawOutput = event.rawOutput;
 			if (event.rawInput !== undefined) entry.rawInput = event.rawInput;
+			entry.identities.push(...event.toolIdentities);
 			if (!entry.mirrored && piToolRef(event.toolName, entry.title)) entry.piOwned = true;
 			entry.args ??= {
 				agent: turn.agent.id,

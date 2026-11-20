@@ -2,7 +2,9 @@
  * Fake ACP (v1) agent for tests.
  *
  * Behavior is driven by markers in the prompt text and FAKE_* env vars:
- *   - "PERMISSION"  asks session/request_permission (string request id) first
+ *   - "PERMISSION"  asks session/request_permission (string request id) first, for tool call "t0"
+ *                   (never reported), titled FAKE_PERMISSION_TITLE (default "rm -rf build"), with
+ *                   ACP `name` FAKE_PERMISSION_NAME when set
  *   - "SLOW"        delays each streamed update (~150ms)
  *                   (a PERMISSION answer that arrives after session/cancel is reported by the next
  *                   ECHO as "CANCELLEDPERM<<<<optionId|outcome>>>>")
@@ -34,6 +36,15 @@
  *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
  *                   when a _session/steering message arrived meanwhile)
  *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
+ *   - FAKE_MCP_NAME=<n>  gives that tool call the structured ACP `name` <n>
+ *     FAKE_MCP_META_NAME=<n>  and/or `_meta.claudeCode.toolName` <n>
+ *   - "ASKPERM"     with MCPCALL: after reporting the tool call, asks permission for it (titled
+ *                   FAKE_PERMISSION_TITLE or like the call, `name` FAKE_PERMISSION_NAME and
+ *                   `_meta.claudeCode.toolName` FAKE_PERMISSION_META_NAME when set);
+ *                   the reply starts "PERM<<<optionId|outcome>>>" and the call is made only when allowed
+ *   - "OVERLAP"     with MCPCALL: first reports a pending call "r1" titled "Run something" with the same
+ *                   input, waits 150ms, and once the MCP call is pending asks permission for r1 (shaped
+ *                   like ASKPERM's); the reply adds "OVERLAPPERM<<<optionId|outcome>>>"
  *   - FAKE_MCP_CANCEL=1  cancels that MCP call after 50ms (`notifications/cancelled`) and ends the
  *                   turn with "AGENT-WENT-ON CALL<<<what the call returned>>>"
  *   - FAKE_MCP_GIVEUP=1  ends the turn after 50ms without waiting for the call
@@ -283,6 +294,26 @@ function serverRequest(method, params) {
 	});
 }
 
+/** The structured identity fields named by two env knobs: ACP `name` and `_meta.claudeCode.toolName`. */
+function identityFields(nameKnob, metaKnob) {
+	const name = process.env[nameKnob];
+	const meta = process.env[metaKnob];
+	return { ...(name ? { name } : {}), ...(meta ? { _meta: { claudeCode: { toolName: meta } } } : {}) };
+}
+
+/** session/request_permission for `toolCallId`, shaped by the FAKE_PERMISSION_* knobs. */
+function askPermission(sessionId, toolCallId, title) {
+	return serverRequest("session/request_permission", {
+		sessionId,
+		toolCall: { toolCallId, title: process.env.FAKE_PERMISSION_TITLE ?? title, ...identityFields("FAKE_PERMISSION_NAME", "FAKE_PERMISSION_META_NAME") },
+		options: [
+			{ optionId: "allow", name: "Allow", kind: "allow_once" },
+			{ optionId: "allow-all", name: "Always allow", kind: "allow_always" },
+			{ optionId: "deny", name: "Deny", kind: "reject_once" },
+		],
+	});
+}
+
 async function handlePrompt(message) {
 	const { sessionId } = message.params;
 	await sendStaleTraffic();
@@ -342,8 +373,26 @@ async function handlePrompt(message) {
 	if (mcpMatch) {
 		const [, tool, json] = mcpMatch;
 		const args = JSON.parse(json);
-		update(sessionId, { sessionUpdate: "tool_call", toolCallId: "m1", title: process.env.FAKE_MCP_TITLE ?? `mcp__pi__${tool}`, status: "pending", rawInput: args });
+		const overlap = text.includes("OVERLAP");
+		if (overlap) {
+			update(sessionId, { sessionUpdate: "tool_call", toolCallId: "r1", title: "Run something", status: "pending", rawInput: args });
+			// WHY: long enough for Pi to show r1 as a native row and wait on it before the Pi tool call arrives.
+			await sleep(150);
+		}
+		const title = process.env.FAKE_MCP_TITLE ?? `mcp__pi__${tool}`;
+		const name = identityFields("FAKE_MCP_NAME", "FAKE_MCP_META_NAME");
+		update(sessionId, { sessionUpdate: "tool_call", toolCallId: "m1", title, ...name, status: "pending", rawInput: args });
 		await sleep(20);
+		let perm = "";
+		if (text.includes("ASKPERM")) {
+			const answer = (await askPermission(sessionId, "m1", title)).result?.outcome ?? {};
+			const chosen = answer.outcome === "selected" ? answer.optionId : answer.outcome ?? "error";
+			perm = `PERM<<<${chosen}>>> `;
+			if (chosen !== "allow") {
+				update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: perm.trim() } });
+				return turn.finish("end_turn");
+			}
+		}
 		const server = (sessionParams.get(sessionId)?.mcpServers ?? []).find((entry) => entry.name === "pi");
 		if (!server) {
 			update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NO-MCP-SERVER" } });
@@ -364,6 +413,12 @@ async function handlePrompt(message) {
 			client.close();
 			return;
 		}
+		if (overlap) {
+			// WHY: by now the provider has handed the call to Pi, which ends r1's waiting row as a side effect.
+			await sleep(50);
+			const answer = (await askPermission(sessionId, "r1", "Run something")).result?.outcome ?? {};
+			perm += `OVERLAPPERM<<<${answer.outcome === "selected" ? answer.optionId : answer.outcome ?? "error"}>>> `;
+		}
 		const response = await pending;
 		client.close();
 		const result = response.result ?? { content: [{ type: "text", text: callText(response) }], isError: true };
@@ -372,7 +427,7 @@ async function handlePrompt(message) {
 		const extra = steered.length > 0 ? ` STEERED<<<${steered.splice(0).join("|")}>>>` : "";
 		update(sessionId, {
 			sessionUpdate: "agent_message_chunk",
-			content: { type: "text", text: `TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
+			content: { type: "text", text: `${perm}TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
 		});
 		promptCounter++;
 		return turn.finish("end_turn");
@@ -394,15 +449,7 @@ async function handlePrompt(message) {
 
 	let approved = null;
 	if (text.includes("PERMISSION")) {
-		const response = await serverRequest("session/request_permission", {
-			sessionId,
-			toolCall: { toolCallId: "t0", title: "rm -rf build" },
-			options: [
-				{ optionId: "allow", name: "Allow", kind: "allow_once" },
-				{ optionId: "allow-all", name: "Always allow", kind: "allow_always" },
-				{ optionId: "deny", name: "Deny", kind: "reject_once" },
-			],
-		});
+		const response = await askPermission(sessionId, "t0", "rm -rf build");
 		const outcome = response.result?.outcome ?? {};
 		approved = outcome.outcome === "selected" ? outcome.optionId : outcome.outcome ?? "error";
 		if (turn.cancelled) cancelledPermission = approved;

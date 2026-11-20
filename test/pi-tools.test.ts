@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Message, Model, Api, Tool } from "@earendil-works/pi-ai";
@@ -65,10 +67,11 @@ function model(handle: AcpProviderHandle): Model<Api> {
 
 const textOf = (message: AssistantMessage) => message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
 
-/** One provider call; returns the final event, which must be `done`. */
-async function step(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, options: Record<string, unknown> = {}) {
-	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools: [echoTool], messages });
-	const last = (await collect(handle.provider.streamSimple(model(handle), context, options))).at(-1);
+/** One provider call with Pi's `tools` (default: echo); returns the final event, which must be `done`. */
+async function step(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, options: Record<string, unknown> & { tools?: Tool[] } = {}) {
+	const { tools = [echoTool], ...streamOptions } = options;
+	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools, messages });
+	const last = (await collect(handle.provider.streamSimple(model(handle), context, streamOptions))).at(-1);
 	assert.ok(last?.type === "done", `expected done, got ${JSON.stringify(last)}`);
 	return last.message;
 }
@@ -105,6 +108,21 @@ for (const transport of ["stdio", "http"] as const) {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Runs `body` with TMPDIR at `dir`, where Pi's MCP server makes its stdio socket directory.
+ * WARN: POSIX only; `os.tmpdir()` ignores TMPDIR on Windows, and the MCP server uses a named pipe there.
+ */
+async function withTmpdir<T>(dir: string, body: () => Promise<T>): Promise<T> {
+	const saved = process.env.TMPDIR;
+	process.env.TMPDIR = dir;
+	try {
+		return await body();
+	} finally {
+		if (saved === undefined) delete process.env.TMPDIR;
+		else process.env.TMPDIR = saved;
+	}
+}
 
 for (const [knob, label, call] of [
 	// The cancellation must have reached the provider, which rejects the call; not a call left pending.
@@ -184,6 +202,134 @@ for (const transport of ["stdio", "http"] as const) {
 	});
 }
 
+/** A provider whose permission policy records each request's title and allows it. */
+function recordingProvider(
+	env: Record<string, string>,
+	asked: string[],
+	overrides: Partial<AcpAgentConfig> = {},
+	extra: Omit<AcpProviderOptions, "config" | "permissionPolicy"> = {},
+) {
+	return makeProvider([agent({ env, ...overrides })], {
+		...extra,
+		permissionPolicy: async (request) => {
+			asked.push(request.title);
+			return { outcome: "selected", optionId: "allow" };
+		},
+	});
+}
+
+/** Runs one MCPCALL turn that asks permission for its echo call; returns the final reply text. */
+async function askedEchoTurn(handle: AcpProviderHandle, tools?: Tool[]): Promise<string> {
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} ASKPERM')];
+	const first = await step(handle, messages, undefined, tools ? { tools } : {});
+	assert.equal(first.stopReason, "toolUse");
+	messages.push(first, ...(await answerTools(handle, first)));
+	return textOf(await step(handle, messages, undefined, tools ? { tools } : {}));
+}
+
+const shoutTool: Tool = { name: "shout", description: "Shouts text", parameters: Type.Object({ text: Type.String() }) };
+
+test("a permission request naming one served Pi tool for a call reported as another goes to the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_NAME: "mcp__pi__shout" }, asked);
+	const text = await askedEchoTurn(handle, [echoTool, shoutTool]);
+	assert.match(text, /PERM<<<allow>>> TOOLS<<<echo,shout>>> RESULT<<<echoed hi>>>/);
+	assert.deepEqual(asked, ["mcp__pi__echo"]);
+});
+
+test("a structurally named Pi tool call shown as a native row is approved without the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_MCP_TITLE: "Run something", FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, {}, { nativeTools: () => true });
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} ASKPERM')];
+	const names: string[] = [];
+	for (let index = 0; index < 5; index++) {
+		const message = await step(handle, messages);
+		names.push(...message.content.flatMap((block) => (block.type === "toolCall" ? [block.name] : [])));
+		messages.push(message);
+		if (message.stopReason !== "toolUse") {
+			assert.match(textOf(message), /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+			assert.deepEqual(names, ["acp_tool", "echo"], "the ordinary title made the report a native row");
+			assert.deepEqual(asked, []);
+			return;
+		}
+		messages.push(...(await answerTools(handle, message)));
+	}
+	assert.fail("the turn did not end");
+});
+
+for (const [label, env] of [
+	["the permission request's structured name", { FAKE_PERMISSION_NAME: "mcp__pi__echo" }],
+	["the structured name the tool call was reported with", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_TITLE: "Echo" }],
+	["both structured fields of the request, agreeing", { FAKE_PERMISSION_NAME: "mcp__pi__echo", FAKE_PERMISSION_META_NAME: "mcp__pi__echo" }],
+] as const) {
+	test(`a live Pi tool call named by ${label} is approved without the policy`, async () => {
+		const asked: string[] = [];
+		const text = await askedEchoTurn(recordingProvider(env, asked));
+		assert.match(text, /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+		assert.deepEqual(asked, []);
+	});
+}
+
+for (const [label, env, title] of [
+	["titled only", {}, "mcp__pi__echo"],
+	["named for a tool Pi does not serve", { FAKE_PERMISSION_NAME: "mcp__pi__rm" }, "mcp__pi__echo"],
+	["named unlike its tool call", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_NAME: "Bash" }, "mcp__pi__echo"],
+	["whose ACP name and Claude tool name disagree", { FAKE_PERMISSION_NAME: "mcp__pi__echo", FAKE_PERMISSION_META_NAME: "Bash" }, "mcp__pi__echo"],
+	["whose call was reported with disagreeing ACP and Claude tool names", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_MCP_META_NAME: "Bash" }, "mcp__pi__echo"],
+] as const) {
+	test(`a permission request for a Pi tool call ${label} goes to the policy`, async () => {
+		const asked: string[] = [];
+		const text = await askedEchoTurn(recordingProvider(env, asked));
+		assert.match(text, /PERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+		assert.deepEqual(asked, [title]);
+	});
+}
+
+test("a pending call whose waiting row Pi's handoff of another call ended is still approved by its structured name", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, {}, { nativeTools: () => true });
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} OVERLAP')];
+	const rows: string[] = [];
+	for (let index = 0; index < 5; index++) {
+		const message = await step(handle, messages);
+		messages.push(message);
+		if (message.stopReason !== "toolUse") {
+			assert.match(textOf(message), /OVERLAPPERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+			assert.match(rows[0] ?? "", /Handed to Pi as echo/, "the handoff ended r1's row with a synthetic status");
+			assert.deepEqual(asked, []);
+			return;
+		}
+		const results = await answerTools(handle, message);
+		for (const result of results) if (result.role === "toolResult" && result.toolName === "acp_tool") rows.push(JSON.stringify(result.content));
+		messages.push(...results);
+	}
+	assert.fail("the turn did not end");
+});
+
+test("a Pi-looking permission request without a reported, pending tool call goes to the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_TITLE: "Read pi/notes.md", FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, { piTools: "both" });
+	const message = await step(handle, [user("PERMISSION")]);
+	assert.match(textOf(message), /\[approved=allow\]/);
+	assert.deepEqual(asked, ["Read pi/notes.md"]);
+});
+
+test("a Pi-named permission request on a session without Pi's MCP server goes to the policy", { skip: process.platform === "win32" }, async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked);
+	const message = await withTmpdir(join(tmpdir(), `missing-${process.pid}`), () => step(handle, [user('MCPCALL:echo:{"text":"hi"} ASKPERM')]));
+	assert.match(textOf(message), /NO-MCP-SERVER/);
+	assert.deepEqual(asked, ["mcp__pi__echo"]);
+});
+
+test("a Pi-named permission request from an isolated request goes to the policy", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked);
+	const message = await step(handle, [user("PERMISSION summarize")], undefined, { cacheRetention: "none" });
+	assert.match(textOf(message), /\[approved=allow\]/);
+	assert.deepEqual(asked, ["rm -rf build"]);
+});
+
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_MCP_TITLE: "Run something" } })], { nativeTools: () => true });
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
@@ -216,6 +362,55 @@ test("pi mode merges the agent's tool switch into the session meta; both mode do
 	const both = makeProvider([agent({ id: "both", ownToolsOffMeta: off })]);
 	const bothInfo = JSON.parse(textOf(await step(both, [user("SESSIONINFO")])));
 	assert.equal(bothInfo._meta, undefined);
+});
+
+const missingTmpdir = () => join(tmpdir(), `pi-acp-missing-${process.pid}`);
+
+test("a Pi-tools-only agent ends the turn when Pi's MCP server cannot start, and the next turn retries it", { skip: process.platform === "win32" }, async () => {
+	const off = { vendor: { tools: [] } };
+	const handle = makeProvider([agent({ piTools: "pi", ownToolsOffMeta: off })]);
+	const context = normalizeContext({ tools: [echoTool], messages: [user("SESSIONINFO")] });
+	const failed = await withTmpdir(missingTmpdir(), () => collect(handle.provider.streamSimple(model(handle), context)));
+	const last = failed.at(-1);
+	assert.ok(last?.type === "error" && last.reason === "error", `expected an error, got ${JSON.stringify(last)}`);
+	assert.match(last.error.errorMessage ?? "", /Pi's tool server \(MCP server "pi"\) failed to start/);
+	assert.match(last.error.errorMessage ?? "", /instead of using its built-in tools/);
+	const info = JSON.parse(textOf(await step(handle, [user("SESSIONINFO")])));
+	assert.equal(info.mcpServers[0]?.name, "pi");
+	assert.deepEqual(info._meta, off);
+});
+
+test("a used session opened while Pi's MCP server was down is replaced, with Pi's tools and a seed, once it is up", { skip: process.platform === "win32" }, async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("SESSIONINFO")];
+	const down = await withTmpdir(missingTmpdir(), () => step(handle, messages));
+	assert.deepEqual(JSON.parse(textOf(down)).mcpServers, [], "a piTools: both agent goes on without Pi's tools");
+	messages.push(down, user("ECHO two"));
+	const echo = await step(handle, messages);
+	assert.match(textOf(echo), /^ECHO\[sess-2\]/, "the next turn runs on a new session");
+	assert.match(textOf(echo), /<conversation-history>[\s\S]*SESSIONINFO[\s\S]*<\/conversation-history>/, "the new session is seeded");
+	messages.push(echo, user("SESSIONINFO"));
+	const info = JSON.parse(textOf(await step(handle, messages)));
+	assert.equal(info.mcpServers[0]?.name, "pi", "the new session has Pi's MCP server");
+});
+
+test("another agent's session with the same id does not vouch for a session opened without Pi's tools", { skip: process.platform === "win32" }, async () => {
+	const handle = makeProvider([agent(), agent({ id: "other", name: "Other agent" })]);
+	const run = async (agentId: string, messages: Message[]) => {
+		const target = handle.provider.getModels().find((candidate) => candidate.id === agentId);
+		assert.ok(target);
+		const last = (await collect(handle.provider.streamSimple(target, normalizeContext({ tools: [echoTool], messages })))).at(-1);
+		assert.ok(last?.type === "done", `expected done, got ${JSON.stringify(last)}`);
+		return last.message;
+	};
+	// WHY: one shared first message keeps the sync state the two same-named sessions share from looking diverged.
+	const first = user("SESSIONINFO");
+	const down = await withTmpdir(missingTmpdir(), () => run("fake", [first]));
+	assert.deepEqual(JSON.parse(textOf(down)).mcpServers, []);
+	const other = JSON.parse(textOf(await run("other", [first])));
+	assert.equal(other.mcpServers[0]?.name, "pi", "the other agent's own sess-1 has Pi's tools");
+	const again = await run("fake", [first, down, user("SESSIONINFO")]);
+	assert.equal(JSON.parse(textOf(again)).mcpServers[0]?.name, "pi", "the first agent left its unwired sess-1");
 });
 
 test("http transport falls back to stdio when the agent does not advertise it", async () => {

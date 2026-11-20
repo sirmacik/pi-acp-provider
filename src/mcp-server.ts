@@ -233,16 +233,39 @@ export class PiMcpServer {
 	 */
 	private readonly httpSessions = new Map<string, HttpSession>();
 	private started: Promise<void> | null = null;
+	/** Bumped by `dispose`, so a start it interrupted neither succeeds nor closes a later start's transports. */
+	private generation = 0;
 
 	constructor(options: PiMcpServerOptions) {
 		this.options = options;
 		this.maxRequestBytes = options.maxRequestBytes ?? MAX_REQUEST_BYTES;
 	}
 
-	/** Starts both transports once; later calls wait for the first. */
+	/**
+	 * Starts both transports once; later calls wait for the first. A failed start is retried by the next
+	 * call; a start that `dispose` interrupted rejects.
+	 */
 	start(): Promise<void> {
-		this.started ??= Promise.all([this.startHttp(), this.startSocket()]).then(() => undefined);
-		return this.started;
+		if (this.started) return this.started;
+		const generation = this.generation;
+		const begin = (transport: () => Promise<void>): Promise<void> => {
+			try {
+				return transport();
+			} catch (error) {
+				return Promise.reject(error);
+			}
+		};
+		const started = Promise.allSettled([begin(() => this.startHttp()), begin(() => this.startSocket())]).then((results) => {
+			if (generation !== this.generation) throw new Error("Pi's MCP server was disposed while starting");
+			const failed = results.find((result) => result.status === "rejected");
+			if (!failed) return;
+			// WHY: a transport that did come up would otherwise keep listening, unreachable, beside the retry's.
+			this.closeTransports();
+			this.started = null;
+			throw failed.reason;
+		});
+		this.started = started;
+		return started;
 	}
 
 	/** The bearer token for `agentId`'s session `nonce`; JSON keeps the two fields from running into each other. */
@@ -303,19 +326,24 @@ export class PiMcpServer {
 	}
 
 	dispose(): void {
+		this.generation++;
+		this.closeTransports();
+		this.nonces.clear();
+		this.started = null;
+	}
+
+	private closeTransports(): void {
 		this.http?.close();
 		this.http?.closeAllConnections();
 		this.socketServer?.close();
 		for (const socket of this.sockets.keys()) socket.destroy();
 		this.sockets.clear();
-		this.nonces.clear();
 		for (const session of this.httpSessions.values()) abortAll(session.inflight);
 		this.httpSessions.clear();
 		if (this.socketDir) rmSync(this.socketDir, { recursive: true, force: true });
 		this.http = null;
 		this.socketServer = null;
 		this.socketDir = null;
-		this.started = null;
 	}
 
 	/**
@@ -401,6 +429,7 @@ export class PiMcpServer {
 		this.http = server;
 		return new Promise((resolve, reject) => {
 			server.once("error", reject);
+			server.once("close", () => reject(new Error("Pi's MCP server was closed while starting")));
 			server.listen(0, "127.0.0.1", () => {
 				const address = server.address();
 				this.httpPort = typeof address === "object" && address ? address.port : 0;
@@ -494,6 +523,7 @@ export class PiMcpServer {
 		this.socketServer = server;
 		return new Promise((resolve, reject) => {
 			server.once("error", reject);
+			server.once("close", () => reject(new Error("Pi's MCP server was closed while starting")));
 			server.listen(this.socketPath, () => resolve());
 		});
 	}

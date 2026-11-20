@@ -161,13 +161,28 @@ Global keys:
   capped at 8 MiB, and the relay's handshake line, which arrives before the
   connection is authenticated, at 4 KiB. Past a cap, HTTP answers 413 and
   closes the connection without reading the rest, and the relay connection is
-  closed before the line is parsed. A call is accepted only from the session of the running turn,
-  and an ended session's nonce is revoked: HTTP answers 403, its calls still
-  running are cancelled, and its relay connections are closed. Over HTTP,
-  `initialize` issues an `Mcp-Session-Id`; a cancellation sent in a later
-  POST of that MCP session reaches its call, and `DELETE` cancels the
-  session's calls and ends it. Permission requests for Pi's tools are approved,
-  since Pi applies its own approval when it runs them.
+  closed before the line is parsed. A call is accepted only from the session
+  of the running turn, and an ended session's nonce is revoked: HTTP answers
+  403, its calls still running are cancelled, and its relay connections are
+  closed. Over HTTP, `initialize` issues an `Mcp-Session-Id`; a cancellation
+  sent in a later POST of that MCP session reaches its call, and `DELETE`
+  cancels the session's calls and ends it.
+  A permission request for a Pi tool is approved
+  without asking, since Pi applies its own approval when it runs the tool,
+  but only when its structure shows it is one: it comes from the running
+  turn's session, which holds a live MCP nonce, it names a tool call that
+  the agent reported and has not reported finished, and every structured
+  tool name present (ACP `name` and Claude Code's `_meta.claudeCode.toolName`,
+  on the request and on each report of the call) names one and the same tool
+  Pi serves, such as `mcp__pi__read`. Titles, and how the call is shown in
+  Pi, are never trusted. Every other request goes to the normal permission
+  policy.
+  If Pi's MCP server fails to start, an agent with `piTools: "pi"` (the
+  `claude-agent-acp` preset) ends the turn with an error naming Pi's tool
+  server instead of running with its built-in tools; a `piTools: "both"`
+  agent goes on without Pi's tools. The next turn tries to start the server
+  again, and a session opened without Pi's tools is then replaced by a new
+  one that has them and first gets the conversation so far as a transcript.
 - **System prompt**: Pi's system prompt goes to each ACP session once (see
   `systemPrompt`), and a changed prompt is sent with the next prompt.
 - **Queue and steering**: a message Pi queues while the agent works reaches
@@ -231,6 +246,9 @@ Global keys:
 - How an agent titles calls to Pi's MCP server is matched by pattern (the four
   agents above were checked). An unrecognized title is shown as an extra
   `acp_tool` row next to Pi's own row for the same call.
+- With `autoApproveTools: false`, an agent that asks permission for a Pi tool
+  without a structured tool name, or before it reports the tool call, gets a
+  second prompt from the policy on top of Pi's own approval.
 - Agents may time out long MCP calls on their side (for example while a Pi
   tool waits on the user). Claude Code's limit is effectively unbounded;
   other agents were not measured.
