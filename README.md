@@ -196,7 +196,10 @@ Global keys:
   `ownToolsOffMeta` (the `claude-agent-acp` preset) it is sent on that
   session, merged over `sessionMeta`, whatever `piTools` says, so the summary
   cannot run the agent's own tools either. Agents without it get no `_meta`
-  on that session, not even `sessionMeta`. Cache-warming requests are answered without contacting the
+  on that session, not even `sessionMeta`. Every permission request from an
+  isolated session is answered with a reject option (`reject_once`, else
+  `reject_always`), or `cancelled` when it offers none, without asking the
+  permission policy. Cache-warming requests are answered without contacting the
   agent.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
   maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other
@@ -227,7 +230,8 @@ Global keys:
   instead.
 - **Permissions**: `session/request_permission` is auto-approved by default
   (`allow_once`, never `allow_always`). Set `autoApproveTools: false` to get an
-  interactive select dialog that names the asking agent.
+  interactive select dialog that names the asking agent. Isolated summary
+  requests never get a permission granted (see Isolated requests).
 - **Auth**: when an agent answers `session/new` with ACP `auth_required`
   (code -32000), the provider calls `authenticate` with the agent's configured
   `authMethod` and retries once. Without one, the error lists the auth methods
@@ -265,7 +269,9 @@ Global keys:
   to a tool that is no longer served fail with "Pi has no tool named …".
 - Agents without an `ownToolsOffMeta` switch keep their built-in tools in
   isolated summary requests. This includes Codex (`codex-acp`), which has no
-  documented ACP setting that turns them off.
+  documented ACP setting that turns them off. Their permission requests there
+  are rejected, but a tool the agent runs without asking permission is not
+  stopped.
 - A context window the agent reports does not change the running Pi
   session: Pi reads the window from the selected model, which it replaces
   only when a model is selected or the provider is registered. The reported

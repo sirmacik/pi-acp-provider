@@ -4,7 +4,8 @@
  * Behavior is driven by markers in the prompt text and FAKE_* env vars:
  *   - "PERMISSION"  asks session/request_permission (string request id) first, for tool call "t0"
  *                   (never reported), titled FAKE_PERMISSION_TITLE (default "rm -rf build"), with
- *                   ACP `name` FAKE_PERMISSION_NAME when set
+ *                   ACP `name` FAKE_PERMISSION_NAME when set; FAKE_PERMISSION_NO_REJECT=1 offers
+ *                   only allow options
  *   - "SLOW"        delays each streamed update (~150ms)
  *                   (a PERMISSION answer that arrives after session/cancel is reported by the next
  *                   ECHO as "CANCELLEDPERM<<<<optionId|outcome>>>>")
@@ -309,7 +310,7 @@ function askPermission(sessionId, toolCallId, title) {
 		options: [
 			{ optionId: "allow", name: "Allow", kind: "allow_once" },
 			{ optionId: "allow-all", name: "Always allow", kind: "allow_always" },
-			{ optionId: "deny", name: "Deny", kind: "reject_once" },
+			...(process.env.FAKE_PERMISSION_NO_REJECT === "1" ? [] : [{ optionId: "deny", name: "Deny", kind: "reject_once" }]),
 		],
 	});
 }
