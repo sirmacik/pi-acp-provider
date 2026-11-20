@@ -43,6 +43,8 @@
  *                   permission request and an MCP echo call over that client; the next ECHO adds
  *                   "STALE<<<permission=<outcome>;mcp=<rejected|accepted:...|pending|none>>>>"
  *   - FAKE_FAIL_SESSION_N=<n>  the nth session/new of this process fails with an internal error
+ *   - FAKE_ORPHAN=<file>  at start, spawns a child in the agent's process group that ignores
+ *                   SIGTERM and writes its pid to <file> (POSIX only)
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
  *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
  *   - FAKE_STEERING=1    advertises and accepts `_session/steering`
@@ -50,6 +52,11 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+
+if (process.env.FAKE_ORPHAN) {
+	const script = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(process.env.FAKE_ORPHAN)}, String(process.pid)); setInterval(() => {}, 1000);`;
+	spawn(process.execPath, ["-e", script], { stdio: "ignore" }).unref();
+}
 
 const SPLIT = process.env.FAKE_SPLIT === "1";
 let authenticated = process.env.FAKE_AUTH !== "1";

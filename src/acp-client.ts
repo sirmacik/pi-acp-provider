@@ -199,10 +199,12 @@ function settleWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
 
 /** Signals the agent's whole process group so its tool subprocesses die too. */
 function signalTree(proc: ChildProcess, signal: NodeJS.Signals): void {
-	if (proc.exitCode !== null || proc.signalCode !== null) return;
 	try {
+		// WHY: the group is signalled even after the leader exited, since members that ignored SIGTERM
+		// (a stdio MCP relay, a tool subprocess) outlive it; the pgid stays reserved while any member
+		// lives, and ESRCH means none does.
 		if (proc.pid !== undefined && !IS_WINDOWS) process.kill(-proc.pid, signal);
-		else proc.kill(signal);
+		else if (proc.exitCode === null && proc.signalCode === null) proc.kill(signal);
 	} catch {
 		// Already gone.
 	}

@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AcpClient, AcpRpcError, type AcpClientOptions, type ServerRequestHandler } from "../src/acp-client.ts";
 import { autoApprove, parsePermissionRequest, parseRpcMessage, type AcpSessionUpdate } from "../src/acp.ts";
@@ -33,6 +36,8 @@ function makeClient(
 	clients.push(client);
 	return client;
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const promptPayload = (sessionId: string, text: string) => ({ sessionId, prompt: [{ type: "text", text }] });
 
@@ -172,6 +177,42 @@ test("a new session that fails after a drain timeout restarts the agent", async 
 	assert.notEqual(client.info?.name, firstPid);
 	const { result } = await runPrompt(client, "ECHO again");
 	assert.equal(result.kind, "finished");
+});
+
+const isAlive = (pid: number): boolean => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+test("a restart kills process-group members that outlive the agent", { skip: process.platform === "win32" }, async () => {
+	const pidFile = join(mkdtempSync(join(tmpdir(), "fake-orphan-")), "pid");
+	const readPid = async (): Promise<number> => {
+		for (let tries = 0; tries < 100 && !existsSync(pidFile); tries++) await sleep(20);
+		return Number(readFileSync(pidFile, "utf8"));
+	};
+	const orphans: number[] = [];
+	try {
+		const client = makeClient({ agent: { env: { FAKE_IGNORE_CANCEL: "1", FAKE_ORPHAN: pidFile } }, cancelGraceMs: 200 });
+		const firstAgent = (await client.ensureReady()).name;
+		const orphan = await readPid();
+		orphans.push(orphan);
+		rmSync(pidFile);
+		await cancelSlowPrompt(client);
+		await cancelSlowPrompt(client);
+		await client.ensureSession();
+		assert.notEqual(client.info?.name, firstAgent, "the second drain timeout restarted the agent");
+		orphans.push(await readPid());
+		// The agent's SIGKILL follows its SIGTERM after a 3 s grace.
+		for (let tries = 0; tries < 50 && isAlive(orphan); tries++) await sleep(100);
+		assert.equal(isAlive(orphan), false, "the old agent's SIGTERM-ignoring child is killed");
+	} finally {
+		for (const pid of orphans) if (isAlive(pid)) process.kill(pid, "SIGKILL");
+		rmSync(dirname(pidFile), { recursive: true, force: true });
+	}
 });
 
 test("process crash rejects the prompt and the client respawns on next use", async () => {
