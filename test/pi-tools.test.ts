@@ -303,6 +303,36 @@ test("pi mode merges the agent's tool switch into the session meta; both mode do
 	assert.equal(bothInfo._meta, undefined);
 });
 
+const missingTmpdir = () => join(tmpdir(), `pi-acp-missing-${process.pid}`);
+
+test("a Pi-tools-only agent ends the turn when Pi's MCP server cannot start, and the next turn retries it", { skip: process.platform === "win32" }, async () => {
+	const off = { vendor: { tools: [] } };
+	const handle = makeProvider([agent({ piTools: "pi", ownToolsOffMeta: off })]);
+	const context = normalizeContext({ tools: [echoTool], messages: [user("SESSIONINFO")] });
+	const failed = await withTmpdir(missingTmpdir(), () => collect(handle.provider.streamSimple(model(handle), context)));
+	const last = failed.at(-1);
+	assert.ok(last?.type === "error" && last.reason === "error", `expected an error, got ${JSON.stringify(last)}`);
+	assert.match(last.error.errorMessage ?? "", /Pi's tool server \(MCP server "pi"\) failed to start/);
+	assert.match(last.error.errorMessage ?? "", /instead of using its built-in tools/);
+	const info = JSON.parse(textOf(await step(handle, [user("SESSIONINFO")])));
+	assert.equal(info.mcpServers[0]?.name, "pi");
+	assert.deepEqual(info._meta, off);
+});
+
+test("a used session opened while Pi's MCP server was down is replaced, with Pi's tools and a seed, once it is up", { skip: process.platform === "win32" }, async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("SESSIONINFO")];
+	const down = await withTmpdir(missingTmpdir(), () => step(handle, messages));
+	assert.deepEqual(JSON.parse(textOf(down)).mcpServers, [], "a piTools: both agent goes on without Pi's tools");
+	messages.push(down, user("ECHO two"));
+	const echo = await step(handle, messages);
+	assert.match(textOf(echo), /^ECHO\[sess-2\]/, "the next turn runs on a new session");
+	assert.match(textOf(echo), /<conversation-history>[\s\S]*SESSIONINFO[\s\S]*<\/conversation-history>/, "the new session is seeded");
+	messages.push(echo, user("SESSIONINFO"));
+	const info = JSON.parse(textOf(await step(handle, messages)));
+	assert.equal(info.mcpServers[0]?.name, "pi", "the new session has Pi's MCP server");
+});
+
 test("http transport falls back to stdio when the agent does not advertise it", async () => {
 	const handle = makeProvider([agent({ mcpTransport: "http" })]);
 	const info = JSON.parse(textOf(await step(handle, [user("SESSIONINFO")])));

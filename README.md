@@ -165,6 +165,12 @@ Global keys:
   `name`, or Claude Code's `_meta.claudeCode.toolName`, on the request or the
   reported call) names a tool Pi serves, such as `mcp__pi__read`. Titles are
   never trusted. Every other request goes to the normal permission policy.
+  If Pi's MCP server fails to start, an agent with `piTools: "pi"` (the
+  `claude-agent-acp` preset) ends the turn with an error naming Pi's tool
+  server instead of running with its built-in tools; a `piTools: "both"`
+  agent goes on without Pi's tools. The next turn tries to start the server
+  again, and a session opened without Pi's tools is then replaced by a new
+  one that has them and first gets the conversation so far as a transcript.
 - **System prompt**: Pi's system prompt goes to each ACP session once (see
   `systemPrompt`), and a changed prompt is sent with the next prompt.
 - **Queue and steering**: a message Pi queues while the agent works reaches

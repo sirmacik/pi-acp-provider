@@ -141,9 +141,16 @@ export class PiMcpServer {
 		this.options = options;
 	}
 
-	/** Starts both transports once; later calls wait for the first. */
+	/** Starts both transports once; later calls wait for the first. A failed start is retried by the next call. */
 	start(): Promise<void> {
-		this.started ??= Promise.all([this.startHttp(), this.startSocket()]).then(() => undefined);
+		this.started ??= Promise.allSettled([this.startHttp(), Promise.resolve().then(() => this.startSocket())]).then((results) => {
+			const failed = results.find((result) => result.status === "rejected");
+			if (!failed) return;
+			// WHY: a transport that did come up would otherwise keep listening, unreachable, beside the retry's.
+			this.closeTransports();
+			this.started = null;
+			throw failed.reason;
+		});
 		return this.started;
 	}
 
@@ -195,17 +202,21 @@ export class PiMcpServer {
 	}
 
 	dispose(): void {
+		this.closeTransports();
+		this.nonces.clear();
+		this.started = null;
+	}
+
+	private closeTransports(): void {
 		this.http?.close();
 		this.http?.closeAllConnections();
 		this.socketServer?.close();
 		for (const socket of this.sockets.keys()) socket.destroy();
 		this.sockets.clear();
-		this.nonces.clear();
 		if (this.socketDir) rmSync(this.socketDir, { recursive: true, force: true });
 		this.http = null;
 		this.socketServer = null;
 		this.socketDir = null;
-		this.started = null;
 	}
 
 	/** Answers one JSON-RPC message; null for notifications and responses. */

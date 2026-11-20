@@ -488,6 +488,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const nonceSessions = new Map<string, { agentId: string; sessionId: string }>();
 	/** The MCP nonce minted for each `session/new` params object, until the session is bound or fails. */
 	const mintedNonces = new WeakMap<Record<string, unknown>, string>();
+	/** The `SessionSetup.key` (Pi tool wiring) each main-client session was opened with, by session id. */
+	const sessionWiring = new Map<string, string>();
 	/** The ACP turn in progress; it spans several Pi messages. */
 	let live: LiveTurn | null = null;
 
@@ -549,6 +551,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/** Forgets an ended session of `agent`'s main client and revokes its MCP nonces. */
 	function endSession(agent: AcpAgentConfig, sessionId: string): void {
 		sync.delete(sessionId);
+		sessionWiring.delete(sessionId);
 		for (const [nonce, owner] of nonceSessions) {
 			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
 			nonceSessions.delete(nonce);
@@ -580,14 +583,26 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return client;
 	};
 
-	/** Starts Pi's MCP server once; null (Pi's tools are not offered) when it cannot start. */
-	async function mcpServer(): Promise<PiMcpServer | null> {
+	/**
+	 * Pi's MCP server for `agent`'s next session, started on first use; null when the agent does not take
+	 * Pi's tools, or when the server cannot start and the agent may go on with its own (`piTools: "both"`).
+	 * A failed start is retried on the next turn.
+	 * WARN: a `piTools: "pi"` agent throws instead (adr-002): its own tools are switched off in favour of
+	 * Pi's, and starting it without them would fall back to built-ins Pi neither approves nor shows.
+	 */
+	async function mcpServer(agent: AcpAgentConfig): Promise<PiMcpServer | null> {
+		if (agent.piTools === "off") return null;
 		mcp ??= new PiMcpServer({ tools: (agentId) => served.get(agentId) ?? [], call: handleMcpCall, log });
 		try {
 			await mcp.start();
 			return mcp;
 		} catch (error) {
 			log?.(`Pi's MCP server failed to start: ${errorMessage(error)}`);
+			if (agent.piTools === "pi") {
+				throw new Error(
+					`Pi's tool server (MCP server "${PI_MCP_SERVER}") failed to start: ${errorMessage(error)}. ${agent.name} works with Pi's tools only, so this turn stops instead of using its built-in tools. Send the message again to retry.`,
+				);
+			}
 			return null;
 		}
 	}
@@ -608,8 +623,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** `session/new` params for Pi's tools and system prompt, chosen from what the agent advertises. */
 	function sessionSetup(agent: AcpAgentConfig, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
+		const key = `pi:mcp=${server && agent.piTools !== "off" ? agent.mcpTransport : "none"}`;
 		return {
-			key: "pi",
+			key,
 			params: (info) => {
 				const params: Record<string, unknown> = {};
 				const piOnly = agent.piTools === "pi" && agent.ownToolsOffMeta !== undefined;
@@ -631,6 +647,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				return params;
 			},
 			settled: (params, sessionId) => {
+				if (sessionId !== undefined) sessionWiring.set(sessionId, key);
 				const nonce = mintedNonces.get(params);
 				if (nonce === undefined) return;
 				mintedNonces.delete(params);
@@ -730,14 +747,20 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		let state: SyncState;
 		let info: AcpAgentInfo;
 		try {
-			const server = agent.piTools === "off" ? null : await mcpServer();
+			const server = await mcpServer(agent);
 			let promptInSession = false;
 			const setup = sessionSetup(agent, server, systemPrompt, () => (promptInSession = true));
 			sessionId = await acp.ensureSession({ signal, setup });
 			let known = sync.get(sessionId);
-			if (known && diverged(known, messages)) {
-				// The Pi branch changed under the session: start over from Pi's history.
-				log?.(`${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`);
+			// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
+			// down would never gain Pi's tools; a new session seeded from Pi's history does.
+			const rewired = sessionWiring.get(sessionId) !== setup.key;
+			if (rewired || (known && diverged(known, messages))) {
+				log?.(
+					rewired
+						? `${agent.id}: session ${sessionId} lacks Pi's tool wiring (${setup.key}); starting a new session`
+						: `${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`,
+				);
 				sync.delete(sessionId);
 				acp.resetSession(cwd);
 				promptInSession = false;
@@ -1311,6 +1334,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			clients.clear();
 			sync.clear();
 			nonceSessions.clear();
+			sessionWiring.clear();
 			mcp?.dispose();
 			mcp = null;
 		},
