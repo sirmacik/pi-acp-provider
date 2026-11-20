@@ -274,7 +274,6 @@ interface PendingSteer {
 /** One key from an agent id and a conversation or session id. */
 const turnKey = (agentId: string, id: string): string => `${agentId}\u0000${id}`;
 
-/** A request Pi runs outside the conversation, such as a summary. */
 interface IsolatedRequest {
 	stream: AssistantMessageEventStream;
 	writer: MessageWriter;

@@ -78,7 +78,6 @@ export function parseRpcMessage(value: unknown): RpcIncoming | null {
 const TOOL_CALL_STATUSES = ["pending", "in_progress", "completed", "failed"] as const;
 export type ToolCallStatus = (typeof TOOL_CALL_STATUSES)[number];
 
-/** Whether the agent reported the tool call as done: no further update changes its outcome. */
 export const isFinalStatus = (status: ToolCallStatus | undefined): status is "completed" | "failed" =>
 	status === "completed" || status === "failed";
 
