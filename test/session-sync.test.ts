@@ -93,6 +93,28 @@ test("a seed the payload left out is sent again with the next prompt", () => {
 	assert.match(texts(build(state, messages))[0]!, /^<conversation-history>/);
 });
 
+test("an omitted seed keeps the anchor before the history it carried", () => {
+	const setUp = (): { state: SyncState; messages: Message[]; own: AssistantMessage } => {
+		const state = newSyncState("");
+		const u1 = user("one");
+		state.delivered.add(messageKey(u1));
+		const own = reply("own reply");
+		state.ownStamps.add(own.timestamp);
+		return { state, messages: [u1, reply("foreign", { provider: "other" }), own, user("two")], own };
+	};
+
+	const accepted = setUp();
+	acceptAll(build(accepted.state, accepted.messages));
+	assert.equal(accepted.state.anchor, accepted.own.timestamp, "with the seed sent, the anchor moves to the own reply");
+
+	const omitted = setUp();
+	const prompt = build(omitted.state, omitted.messages);
+	assert.match(texts(prompt)[0]!, /^<conversation-history>[\s\S]*foreign/);
+	prompt.commit(prompt.parts.slice(1));
+	assert.equal(omitted.state.anchor, undefined);
+	assert.match(texts(build(omitted.state, omitted.messages))[0]!, /^<conversation-history>[\s\S]*foreign/);
+});
+
 test("own replies move the anchor, so later prompts carry only what follows them", () => {
 	const state = newSyncState("");
 	const u1 = user("one");
@@ -167,8 +189,23 @@ test("kept holds only delivered messages a later request still held", () => {
 	keepConfirmed(state, later);
 	assert.ok(state.kept.has(messageKey(u1)));
 	assert.ok(!state.kept.has(messageKey(added)));
+	assert.ok(!state.kept.has(messageKey(a1)), "a message never delivered or shown is not kept");
 	assert.equal(diverged(state, later), false, "a message seen once and never again is not history");
 	assert.equal(diverged(state, [a1, u2]), true, "a kept user is gone");
+});
+
+test("diverged sees a kept user removed while the first message stays", () => {
+	const state = newSyncState("");
+	const u0 = user("zero");
+	const a0 = reply("answer zero", { provider: "other" });
+	const u1 = user("one");
+	const u2 = user("two");
+	state.first = messageKey(u0);
+	state.delivered.add(messageKey(u1));
+	keepConfirmed(state, [u0, a0, u1]);
+	assert.ok(state.kept.has(messageKey(u1)));
+	assert.equal(diverged(state, [u0, a0, u1, u2]), false);
+	assert.equal(diverged(state, [u0, a0, u2]), true);
 });
 
 test("a pending steer goes as a late user block, never inside the seed", () => {
