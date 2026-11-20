@@ -82,7 +82,6 @@ export function createPiToolBridge({ lives, isCurrent, syncOf, wiringOf, dispatc
 		);
 	}
 
-	/** Revokes the MCP nonces bound to an ended session of `agent`'s main client. */
 	function revokeSessionNonces(agent: AcpAgentConfig, sessionId: string): void {
 		for (const [nonce, owner] of nonceSessions) {
 			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
