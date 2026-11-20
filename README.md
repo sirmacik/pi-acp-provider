@@ -174,7 +174,10 @@ Global keys:
   twice is dropped, and the error says so. A message no longer on Pi's
   active branch (after a fork or tree navigation) is not sent. The same holds
   for the rest of a prompt: a prompt the agent rejected, or one an `onPayload`
-  hook failed on, is sent in full again with the next request.
+  hook failed on, is sent in full again with the next request, its user
+  messages as requests even when Pi keeps the failed reply. Content an
+  `onPayload` hook removes or rewrites counts as not sent, so it goes with
+  the next prompt.
 - **Isolated requests**: compaction and branch summaries (`cacheRetention:
   "none"`) run in a separate, throwaway agent process, so the live session
   is not touched. They get no Pi tools, and when the agent has

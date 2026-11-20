@@ -247,6 +247,54 @@ function tailStart(messages: readonly Message[]): number {
 }
 
 /**
+ * Index after the last assistant message that answered: where the users of the request Pi makes start.
+ * An assistant message that ended in `error` answered nothing, so the users before it still wait for a
+ * reply; the ones the session already got are filtered out as delivered. An `aborted` one counts as an
+ * answer: the user stopped that request, so it must not run again.
+ */
+function requestStart(messages: readonly Message[]): number {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const candidate = messages[index];
+		if (candidate?.role === "assistant" && candidate.stopReason !== "error") return index + 1;
+	}
+	return 0;
+}
+
+/** Blocks of a prompt and what sending them tells about the session, once the agent accepts it. */
+interface PromptPart {
+	blocks: AcpContentBlock[];
+	/** The blocks as sent, fixed before an `onPayload` hook can change them. */
+	sent: string[];
+	record: () => void;
+	/** Key of the pending steer the part carries. */
+	steer: string | undefined;
+}
+
+function promptPart(blocks: AcpContentBlock[], record: () => void, steer?: string): PromptPart {
+	return { blocks, sent: blocks.map((block) => JSON.stringify(block)), record, steer };
+}
+
+/**
+ * The parts whose blocks all reach the agent in `payload`, which an `onPayload` hook may have replaced
+ * or changed. WARN: a part a hook rewrote counts as not sent, so its content is sent again next time.
+ */
+function partsIn(parts: readonly PromptPart[], payload: unknown): PromptPart[] {
+	const prompt = isRecord(payload) && Array.isArray(payload.prompt) ? payload.prompt : [];
+	const available = new Map<string, number>();
+	for (const block of prompt) {
+		const text = JSON.stringify(block);
+		available.set(text, (available.get(text) ?? 0) + 1);
+	}
+	return parts.filter((part) => {
+		const needed = new Map<string, number>();
+		for (const text of part.sent) needed.set(text, (needed.get(text) ?? 0) + 1);
+		for (const [text, count] of needed) if ((available.get(text) ?? 0) < count) return false;
+		for (const [text, count] of needed) available.set(text, (available.get(text) ?? 0) - count);
+		return true;
+	});
+}
+
+/**
  * Builds the streamed `AssistantMessage`: keeps one text or thinking block
  * open at a time and emits balanced start/delta/end events for it.
  */
@@ -773,7 +821,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			live.controller.abort();
 			live = null;
 		}
-		const users = tail.filter((candidate): candidate is UserMessage => candidate.role === "user");
+		const users = messages
+			.slice(requestStart(messages))
+			.filter((candidate): candidate is UserMessage => candidate.role === "user");
 		if (users.length === 0) {
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
 			return;
@@ -822,55 +872,49 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 
-		const blocks: AcpContentBlock[] = [];
-		const sendsSystemPrompt = agent.systemPrompt !== "off" && systemPrompt !== "" && state.systemPrompt !== systemPrompt;
-		if (sendsSystemPrompt) {
-			blocks.push(
-				tagged(
-					"system-instructions",
-					systemPrompt,
-					state.systemPrompt
-						? "Pi, the host application you run in, updated its instructions. They replace the earlier ones:"
-						: "Instructions from Pi, the host application you run in. Follow them together with your own:",
-				),
-			);
+		const parts: PromptPart[] = [];
+		if (agent.systemPrompt !== "off" && systemPrompt !== "" && state.systemPrompt !== systemPrompt) {
+			const intro = state.systemPrompt
+				? "Pi, the host application you run in, updated its instructions. They replace the earlier ones:"
+				: "Instructions from Pi, the host application you run in. Follow them together with your own:";
+			parts.push(promptPart([tagged("system-instructions", systemPrompt, intro)], () => (state.systemPrompt = systemPrompt)));
 		}
 		const held = recoverSteers(agent.id, messages, state);
-		const heldKeys = held.map((steer) => steer.key);
+		const isHeld = (candidate: Message): boolean => held.some((steer) => steer.key === messageKey(candidate));
 		const late = held.filter((steer) => !isDropped(steer));
-		const lateKeys = late.map((steer) => steer.key);
+		const requestUsers = new Set(users);
 		const history = messages.slice(0, messages.length - tail.length);
 		const anchorIndex = state.anchor === undefined ? -1 : history.findLastIndex((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
-		// WHY: a pending steer is a request the agent never got, so it goes as a user block, never as history.
+		// WHY: pending steers and the users of an unanswered request are requests the agent never got, so
+		// they go as user blocks, never as history.
 		const unseen = history
 			.slice(anchorIndex + 1)
-			.filter((candidate) => !isOwn(state, candidate) && !heldKeys.includes(messageKey(candidate)));
-		if (unseen.length > 0) {
-			blocks.push(
-				tagged(
-					"conversation-history",
-					renderTranscript(unseen),
-					"Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:",
-				),
+			.filter((candidate) => !isOwn(state, candidate) && !isHeld(candidate) && !requestUsers.has(candidate as UserMessage));
+		const transcript = renderTranscript(unseen);
+		if (transcript) {
+			const intro = "Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:";
+			parts.push(
+				promptPart([tagged("conversation-history", transcript, intro)], () => {
+					for (const seen of unseen) state.seeded.add(messageKey(seen));
+				}),
 			);
 		}
-		if (late.length > 0) {
-			blocks.push({ type: "text", text: LATE_STEER_NOTE });
-			for (const steer of late) blocks.push(...userBlocks(steer.message, info.capabilities.image));
+		if (late.length > 0) parts.push(promptPart([{ type: "text", text: LATE_STEER_NOTE }], () => {}));
+		for (const steer of late) {
+			parts.push(promptPart(userBlocks(steer.message, info.capabilities.image), () => deliverSteers(agent.id, state, [steer.key]), steer.key));
 		}
-		const pendingUsers = users.filter((user) => !state.delivered.has(messageKey(user)) && !heldKeys.includes(messageKey(user)));
-		const sentUsers = pendingUsers.length > 0 ? pendingUsers : users.slice(-1);
-		for (const user of sentUsers) blocks.push(...userBlocks(user, info.capabilities.image));
-		const commit = (): void => {
-			if (sendsSystemPrompt) state.systemPrompt = systemPrompt;
-			for (const seen of unseen) state.seeded.add(messageKey(seen));
-			for (const user of sentUsers) state.delivered.add(messageKey(user));
-			deliverSteers(agent.id, state, lateKeys);
-			const newestOwn = history.findLast((candidate) => isOwnReply(state, candidate));
-			if (newestOwn) state.anchor = newestOwn.timestamp;
-			state.first = messages[0] ? messageKey(messages[0]) : undefined;
-			state.ownStamps.add(message.timestamp);
-		};
+		const sendable = users.filter((user) => !isHeld(user));
+		const fresh = sendable.filter((user) => !state.delivered.has(messageKey(user)));
+		// WHY: with nothing new, the request is Pi retrying the last one; a recovered steer is new enough.
+		const sentUsers = fresh.length > 0 || late.length > 0 ? fresh : sendable.slice(-1);
+		if (sentUsers.length === 0 && late.length === 0) {
+			writer.fail("error", `No user message left to send to ${agent.name}.`);
+			return;
+		}
+		for (const user of sentUsers) {
+			parts.push(promptPart(userBlocks(user, info.capabilities.image), () => state.delivered.add(messageKey(user))));
+		}
+		const blocks = parts.flatMap((part) => part.blocks);
 
 		stream.push({ type: "start", partial: message });
 		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
@@ -882,13 +926,23 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				);
 			});
 		let payload: unknown;
+		let sent: PromptPart[];
 		try {
 			const defaultPayload = { sessionId, prompt: blocks };
 			payload = (await streamOptions?.onPayload?.(defaultPayload, model)) ?? defaultPayload;
+			sent = partsIn(parts, payload);
 		} catch (error) {
 			abortedOrError(error);
 			return;
 		}
+		const commit = (): void => {
+			for (const part of sent) part.record();
+			const newestOwn = history.findLast((candidate) => isOwnReply(state, candidate));
+			if (newestOwn) state.anchor = newestOwn.timestamp;
+			state.first = messages[0] ? messageKey(messages[0]) : undefined;
+			state.ownStamps.add(message.timestamp);
+		};
+		const sentSteers = sent.flatMap((part) => (part.steer === undefined ? [] : [part.steer]));
 
 		const turn: LiveTurn = {
 			agent,
@@ -913,7 +967,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			notice: undefined,
 		};
 		live = turn;
-		startPrompt(turn, { payload, commit, steers: lateKeys });
+		startPrompt(turn, { payload, commit, steers: sentSteers });
 		attach(turn, writer, signal);
 	}
 

@@ -413,6 +413,31 @@ test("a steer the agent rejected twice is dropped and the user is told", async (
 	assert.equal(retry.prompt, "ECHO next");
 });
 
+test("a retry with no new user message sends a recovered steer once", async () => {
+	const handle = makeProvider([agent({ piTools: "off", env: { FAKE_FAIL_PROMPT_N: "2" } })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	const rejected = await capture(handle, messages);
+	assert.equal(rejected.message.stopReason, "error");
+	messages.push(rejected.message);
+	const retry = await capture(handle, messages);
+	assert.notEqual(retry.message.stopReason, "error");
+	assert.match(retry.prompt, /^Delivered late: [^\n]*\nSTEER-LATE$/);
+});
+
+test("a retry with no new user message does not resend a dropped steer", async () => {
+	const handle = makeProvider([agent({ piTools: "off", env: { FAKE_FAIL_PROMPT_N: "2,3" } })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "hello");
+	const first = await capture(handle, messages);
+	assert.equal(first.message.stopReason, "error");
+	messages.push(first.message);
+	const second = await capture(handle, messages);
+	assert.match(second.message.errorMessage ?? "", /dropped 1 steering message/);
+	const third = await capture(handle, messages);
+	assert.equal(third.message.stopReason, "error");
+	assert.match(third.message.errorMessage ?? "", /No user message left to send/);
+	assert.equal(third.prompt, "", "nothing reached the agent");
+});
+
 test("a steer pending when its session is replaced stays out of the new session's seed and follows it", async () => {
 	const handle = makeProvider([agent({ piTools: "off" })], { cancelGraceMs: 300, nativeTools: () => true });
 	const messages = await queueSteer(handle, "IGNORE-CANCEL hello");
@@ -456,14 +481,19 @@ const foreignReply = (text: string): Message =>
 		timestamp: ++clock,
 	}) as Message;
 
-/** One provider call that records the prompt text it sends; returns the final message, whatever its end. */
-async function capture(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, onPayload?: () => void) {
+type Payload = { sessionId: string; prompt: { type: string; text?: string }[] };
+
+/**
+ * One provider call that records the prompt text it sends, after `hook` (an `onPayload` that may throw
+ * or change the payload); returns the final message, whatever its end.
+ */
+async function capture(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, hook?: (payload: Payload) => void) {
 	const prompts: string[] = [];
 	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools: [echoTool], messages });
 	const options = {
 		onPayload: (payload: unknown) => {
-			onPayload?.();
-			const blocks = (payload as { prompt: { type: string; text?: string }[] }).prompt;
+			hook?.(payload as Payload);
+			const blocks = (payload as Payload).prompt;
 			prompts.push(blocks.map((block) => block.text ?? `[${block.type}]`).join("\n"));
 			return undefined;
 		},
@@ -478,10 +508,11 @@ function retryContext(): Message[] {
 	return [user("earlier question"), foreignReply("FOREIGN-REPLY"), user("ECHO first"), user("second"), user("third")];
 }
 
-function assertFullPrompt(prompt: string): void {
+function assertFullPrompt(prompt: string, extra = ""): void {
 	assert.match(prompt, /<system-instructions>[\s\S]*SYSTEM-RULES/);
 	assert.match(prompt, /<conversation-history>[\s\S]*FOREIGN-REPLY[\s\S]*<\/conversation-history>/);
-	assert.match(prompt, /ECHO first\nsecond\nthird$/);
+	assert.doesNotMatch(prompt, /<conversation-history>[\s\S]*ECHO first[\s\S]*<\/conversation-history>/);
+	assert.ok(prompt.endsWith(`ECHO first\nsecond\nthird${extra}`), prompt);
 }
 
 async function assertThirdRequestIsBare(handle: AcpProviderHandle, messages: Message[], reply: AssistantMessage): Promise<void> {
@@ -491,29 +522,73 @@ async function assertThirdRequestIsBare(handle: AcpProviderHandle, messages: Mes
 	assert.equal(third.prompt, "ECHO fourth", "the third request repeats neither the instructions, the seed nor the users");
 }
 
-test("a prompt the agent rejects once is retried with the instructions, the history seed and every queued user", async () => {
+/**
+ * The request after a failed one: the same context (Pi retrying), or one that keeps the failed reply and
+ * adds a user message, whose prompt must still carry the failed request's users as requests.
+ */
+function afterFailure(messages: Message[], failed: AssistantMessage, keepFailed: boolean): string {
+	if (!keepFailed) return "";
+	messages.push(failed, user("ECHO extra"));
+	return "\nECHO extra";
+}
+
+for (const keepFailed of [false, true]) {
+	const variant = keepFailed ? ", keeping the failed reply," : "";
+	test(`a prompt the agent rejects once is retried${variant} with the instructions, the history seed and every queued user`, async () => {
+		const handle = makeProvider([agent({ env: { FAKE_FAIL_PROMPT_N: "1" } })]);
+		const messages = retryContext();
+		const rejected = await capture(handle, messages, "SYSTEM-RULES");
+		assert.equal(rejected.message.stopReason, "error");
+		assert.match(rejected.message.errorMessage ?? "", /one-shot rejection/);
+		const extra = afterFailure(messages, rejected.message, keepFailed);
+		const retry = await capture(handle, messages, "SYSTEM-RULES");
+		assert.equal(retry.message.stopReason, "stop");
+		assertFullPrompt(retry.prompt, extra);
+		await assertThirdRequestIsBare(handle, messages, retry.message);
+	});
+
+	test(`a prompt dropped by a throwing onPayload hook is sent in full by the next request${variant}`, async () => {
+		const handle = makeProvider([agent()]);
+		const messages = retryContext();
+		const thrown = await capture(handle, messages, "SYSTEM-RULES", () => {
+			throw new Error("hook failed");
+		});
+		assert.equal(thrown.message.stopReason, "error");
+		const extra = afterFailure(messages, thrown.message, keepFailed);
+		const retry = await capture(handle, messages, "SYSTEM-RULES");
+		assert.equal(retry.message.stopReason, "stop");
+		assertFullPrompt(retry.prompt, extra);
+		await assertThirdRequestIsBare(handle, messages, retry.message);
+	});
+}
+
+test("a kept failed reply with nothing to show adds no history seed", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_FAIL_PROMPT_N: "1" } })]);
-	const messages = retryContext();
-	const rejected = await capture(handle, messages, "SYSTEM-RULES");
+	const messages: Message[] = [user("ECHO first")];
+	const rejected = await capture(handle, messages);
 	assert.equal(rejected.message.stopReason, "error");
-	assert.match(rejected.message.errorMessage ?? "", /one-shot rejection/);
-	const retry = await capture(handle, messages, "SYSTEM-RULES");
+	messages.push(rejected.message, user("ECHO second"));
+	const retry = await capture(handle, messages);
 	assert.equal(retry.message.stopReason, "stop");
-	assertFullPrompt(retry.prompt);
-	await assertThirdRequestIsBare(handle, messages, retry.message);
+	assert.equal(retry.prompt, "ECHO first\nECHO second");
 });
 
-test("a prompt dropped by a throwing onPayload hook is sent in full by the next request", async () => {
-	const handle = makeProvider([agent()]);
-	const messages = retryContext();
-	const thrown = await capture(handle, messages, "SYSTEM-RULES", () => {
-		throw new Error("hook failed");
+test("content an onPayload hook removes from the prompt is sent again with the next one", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await queueSteer(handle, "MAXTOKENS work");
+	const ended = await step(handle, messages);
+	assert.equal(ended.stopReason, "length");
+	messages.push(ended, user("ECHO next"));
+	const stripped = await capture(handle, messages, undefined, (payload) => {
+		const kept = payload.prompt.filter((block) => !/STEER-LATE|Delivered late/.test(block.text ?? ""));
+		payload.prompt.splice(0, payload.prompt.length, ...kept);
 	});
-	assert.equal(thrown.message.stopReason, "error");
-	const retry = await capture(handle, messages, "SYSTEM-RULES");
-	assert.equal(retry.message.stopReason, "stop");
-	assertFullPrompt(retry.prompt);
-	await assertThirdRequestIsBare(handle, messages, retry.message);
+	assert.equal(stripped.message.stopReason, "stop");
+	assert.equal(stripped.prompt, "ECHO next");
+	messages.push(stripped.message, user("ECHO again"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, LATE_STEER);
+	assert.match(next.prompt, /\nECHO again$/);
 });
 
 test("cache-warming requests do not reach the agent", async () => {
