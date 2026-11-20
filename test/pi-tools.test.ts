@@ -330,6 +330,78 @@ test("isolated requests run in a separate agent process", async () => {
 	assert.match(again, /ECHO\[sess-1\]<<<ECHO again>>>/, "the main session is untouched");
 });
 
+const foreignReply = (text: string): Message =>
+	({
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "x",
+		provider: "other",
+		model: "m",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop",
+		timestamp: ++clock,
+	}) as Message;
+
+/** One provider call that records the prompt text it sends; returns the final message, whatever its end. */
+async function capture(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, onPayload?: () => void) {
+	const prompts: string[] = [];
+	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools: [echoTool], messages });
+	const options = {
+		onPayload: (payload: unknown) => {
+			onPayload?.();
+			const blocks = (payload as { prompt: { type: string; text?: string }[] }).prompt;
+			prompts.push(blocks.map((block) => block.text ?? `[${block.type}]`).join("\n"));
+			return undefined;
+		},
+	};
+	const last = (await collect(handle.provider.streamSimple(model(handle), context, options))).at(-1);
+	assert.ok(last?.type === "done" || last?.type === "error", `expected an end, got ${JSON.stringify(last)}`);
+	return { message: last.type === "done" ? last.message : last.error, prompt: prompts.join("\n") };
+}
+
+/** The M1 context: a system prompt, foreign history, and three queued users. */
+function retryContext(): Message[] {
+	return [user("earlier question"), foreignReply("FOREIGN-REPLY"), user("ECHO first"), user("second"), user("third")];
+}
+
+function assertFullPrompt(prompt: string): void {
+	assert.match(prompt, /<system-instructions>[\s\S]*SYSTEM-RULES/);
+	assert.match(prompt, /<conversation-history>[\s\S]*FOREIGN-REPLY[\s\S]*<\/conversation-history>/);
+	assert.match(prompt, /ECHO first\nsecond\nthird$/);
+}
+
+async function assertThirdRequestIsBare(handle: AcpProviderHandle, messages: Message[], reply: AssistantMessage): Promise<void> {
+	messages.push(reply, user("ECHO fourth"));
+	const third = await capture(handle, messages, "SYSTEM-RULES");
+	assert.equal(third.message.stopReason, "stop");
+	assert.equal(third.prompt, "ECHO fourth", "the third request repeats neither the instructions, the seed nor the users");
+}
+
+test("a prompt the agent rejects once is retried with the instructions, the history seed and every queued user", async () => {
+	const handle = makeProvider([agent({ env: { FAKE_FAIL_PROMPT_N: "1" } })]);
+	const messages = retryContext();
+	const rejected = await capture(handle, messages, "SYSTEM-RULES");
+	assert.equal(rejected.message.stopReason, "error");
+	assert.match(rejected.message.errorMessage ?? "", /one-shot rejection/);
+	const retry = await capture(handle, messages, "SYSTEM-RULES");
+	assert.equal(retry.message.stopReason, "stop");
+	assertFullPrompt(retry.prompt);
+	await assertThirdRequestIsBare(handle, messages, retry.message);
+});
+
+test("a prompt dropped by a throwing onPayload hook is sent in full by the next request", async () => {
+	const handle = makeProvider([agent()]);
+	const messages = retryContext();
+	const thrown = await capture(handle, messages, "SYSTEM-RULES", () => {
+		throw new Error("hook failed");
+	});
+	assert.equal(thrown.message.stopReason, "error");
+	const retry = await capture(handle, messages, "SYSTEM-RULES");
+	assert.equal(retry.message.stopReason, "stop");
+	assertFullPrompt(retry.prompt);
+	await assertThirdRequestIsBare(handle, messages, retry.message);
+});
+
 test("cache-warming requests do not reach the agent", async () => {
 	const handle = makeProvider([agent({ command: "/nonexistent/agent" })]);
 	const message = await step(handle, [user("hi")], undefined, { maxTokens: 1, disableContinuation: true });

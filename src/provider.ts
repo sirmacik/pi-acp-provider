@@ -330,6 +330,17 @@ interface PiCall {
 	resolve: (result: McpCallResult) => void;
 }
 
+/** One `session/prompt` of a turn and what it delivers once the agent accepts it. */
+interface TurnPrompt {
+	payload: unknown;
+	/**
+	 * Records what the prompt delivered; runs once, on the first update attributed to the prompt or its
+	 * `finished` result. WARN: nothing the prompt carries may be recorded before this: a rejected or
+	 * aborted prompt must leave the sync state as it was, so the retry sends it all again.
+	 */
+	commit: () => void;
+}
+
 interface LiveTurn {
 	agent: AcpAgentConfig;
 	modelId: string;
@@ -350,7 +361,7 @@ interface LiveTurn {
 	 */
 	accepting: boolean;
 	/** Prompts to send, in order, once the running one ends (steering the agent could not take mid-turn). */
-	queued: AcpContentBlock[][];
+	queued: TurnPrompt[];
 	tools: Map<string, ToolEntry>;
 	/** Pi tool calls still waiting for Pi's result; the agent may cancel one or end the turn first. */
 	piCalls: Map<string, PiCall>;
@@ -374,6 +385,12 @@ interface SyncState {
 	ours: Set<string>;
 	/** Keys of user messages already delivered (prompted, steered, or attached to a tool result). */
 	delivered: Set<string>;
+	/**
+	 * Keys of history messages the session accepted in a `<conversation-history>` seed. Kept apart from
+	 * `anchor`, which moves only past the session's own replies, so a seed of foreign history is not
+	 * sent again while no own reply follows it.
+	 */
+	seeded: Set<string>;
 	/** The Pi system prompt the session last received. */
 	systemPrompt: string;
 }
@@ -619,12 +636,16 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 	}
 
+	/** Whether the session streamed `message` itself. */
+	function isOwnReply(state: SyncState, message: Message): boolean {
+		return message.role === "assistant" && message.provider === ACP_PROVIDER_ID && state.ownStamps.has(message.timestamp);
+	}
+
 	/** Whether the session produced `message`, or already received it. */
 	function isOwn(state: SyncState, message: Message): boolean {
-		if (message.role === "assistant") return message.provider === ACP_PROVIDER_ID && state.ownStamps.has(message.timestamp);
+		if (isOwnReply(state, message) || state.seeded.has(messageKey(message))) return true;
 		if (message.role === "toolResult") return state.ours.has(message.toolCallId);
-		if (message.role === "user") return state.delivered.has(messageKey(message));
-		return false;
+		return message.role === "user" && state.delivered.has(messageKey(message));
 	}
 
 	async function runTurn(
@@ -716,6 +737,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				first: undefined,
 				ours: new Set(),
 				delivered: new Set(),
+				seeded: new Set(),
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
 			sync.set(sessionId, state);
@@ -727,7 +749,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 
 		const blocks: AcpContentBlock[] = [];
-		if (agent.systemPrompt !== "off" && systemPrompt && state.systemPrompt !== systemPrompt) {
+		const sendsSystemPrompt = agent.systemPrompt !== "off" && systemPrompt !== "" && state.systemPrompt !== systemPrompt;
+		if (sendsSystemPrompt) {
 			blocks.push(
 				tagged(
 					"system-instructions",
@@ -737,7 +760,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 						: "Instructions from Pi, the host application you run in. Follow them together with your own:",
 				),
 			);
-			state.systemPrompt = systemPrompt;
 		}
 		const history = messages.slice(0, messages.length - tail.length);
 		const anchorIndex = state.anchor === undefined ? -1 : history.findLastIndex((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
@@ -752,14 +774,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			);
 		}
 		const pendingUsers = users.filter((user) => !state.delivered.has(messageKey(user)));
-		for (const user of pendingUsers.length > 0 ? pendingUsers : users.slice(-1)) {
-			blocks.push(...userBlocks(user, info.capabilities.image));
-			state.delivered.add(messageKey(user));
-		}
-		const newestOwn = history.findLast((candidate) => candidate.role === "assistant" && isOwn(state, candidate));
-		if (newestOwn) state.anchor = newestOwn.timestamp;
-		state.first = messages[0] ? messageKey(messages[0]) : undefined;
-		state.ownStamps.add(message.timestamp);
+		const sentUsers = pendingUsers.length > 0 ? pendingUsers : users.slice(-1);
+		for (const user of sentUsers) blocks.push(...userBlocks(user, info.capabilities.image));
+		const commit = (): void => {
+			if (sendsSystemPrompt) state.systemPrompt = systemPrompt;
+			for (const seen of unseen) state.seeded.add(messageKey(seen));
+			for (const user of sentUsers) state.delivered.add(messageKey(user));
+			const newestOwn = history.findLast((candidate) => isOwnReply(state, candidate));
+			if (newestOwn) state.anchor = newestOwn.timestamp;
+			state.first = messages[0] ? messageKey(messages[0]) : undefined;
+			state.ownStamps.add(message.timestamp);
+		};
 
 		stream.push({ type: "start", partial: message });
 		const onProviderStreamEvent = streamOptions?.onProviderStreamEvent;
@@ -801,7 +826,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			onRawUpdate,
 		};
 		live = turn;
-		startPrompt(turn, payload);
+		startPrompt(turn, { payload, commit });
 		attach(turn, writer, signal);
 	}
 
@@ -867,32 +892,44 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			}
 			call.resolve(reply);
 		}
-		if (!steerDelivered) enqueuePrompt(turn, steerBlocks);
+		if (!steerDelivered) enqueuePrompt(turn, { payload: { sessionId: turn.sessionId, prompt: steerBlocks }, commit: () => {} });
 	}
 
-	/** Sends `blocks` as the turn's next prompt: now if the agent finished, else once the running prompt ends. */
-	function enqueuePrompt(turn: LiveTurn, blocks: AcpContentBlock[]): void {
+	/** Sends `prompt` as the turn's next prompt: now if the agent finished, else once the running prompt ends. */
+	function enqueuePrompt(turn: LiveTurn, prompt: TurnPrompt): void {
 		const finishedCleanly =
 			turn.outcome !== null && "result" in turn.outcome && turn.outcome.result.kind === "finished" && turn.outcome.result.stopReason === "end_turn";
 		if (!turn.running && finishedCleanly) {
 			turn.outcome = null;
-			startPrompt(turn, { sessionId: turn.sessionId, prompt: blocks });
-		} else if (turn.running) turn.queued.push(blocks);
+			startPrompt(turn, prompt);
+		} else if (turn.running) turn.queued.push(prompt);
 	}
 
-	function startPrompt(turn: LiveTurn, payload: unknown): void {
+	function startPrompt(turn: LiveTurn, prompt: TurnPrompt): void {
 		turn.running = true;
+		let accepted = false;
+		const accept = (): void => {
+			if (accepted || turn.controller.signal.aborted) return;
+			accepted = true;
+			prompt.commit();
+		};
 		turn.acp
 			.prompt({
 				sessionId: turn.sessionId,
-				payload,
+				payload: prompt.payload,
 				signal: turn.controller.signal,
 				onRawUpdate: turn.onRawUpdate,
 				onSent: () => (turn.accepting = true),
-				onUpdate: (update) => dispatch(turn, update),
+				onUpdate: (update) => {
+					accept();
+					dispatch(turn, update);
+				},
 			})
 			.then(
-				(result) => settleTurn(turn, { result }),
+				(result) => {
+					if (result.kind === "finished") accept();
+					settleTurn(turn, { result });
+				},
 				(error: unknown) => settleTurn(turn, { error, auth: turn.acp.info }),
 			);
 	}
@@ -1063,7 +1100,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const next = turn.queued.shift();
 		const cleanEnd = "result" in outcome && outcome.result.kind === "finished" && outcome.result.stopReason === "end_turn";
 		if (next && cleanEnd && !turn.controller.signal.aborted) {
-			startPrompt(turn, { sessionId: turn.sessionId, prompt: next });
+			startPrompt(turn, next);
 			return;
 		}
 		turn.outcome = outcome;
