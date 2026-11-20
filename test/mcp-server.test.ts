@@ -37,18 +37,97 @@ async function post(url: string, token: string): Promise<number> {
 	return response.status;
 }
 
-test("http MCP answers only a minted, unrevoked nonce of the agent in the path", async () => {
+test("http MCP answers only a minted, unrevoked nonce of the agent in the path, with that session's token", async () => {
 	const server = await startServer();
 	const nonce = server.mint("a");
 	const entry = server.serverFor("a", "http", nonce);
 	assert.ok("url" in entry);
 	const token = entry.headers[0]!.value.replace("Bearer ", "");
+	const otherNonce = server.mint("a");
+	const otherAgent = server.serverFor("b", "http", server.mint("b"));
+	assert.ok("url" in otherAgent);
 	assert.equal(await post(entry.url, token), 200);
-	assert.equal(await post(entry.url.replace(nonce, "0".repeat(32)), token), 403, "an unknown nonce");
-	assert.equal(await post(entry.url.replace("/mcp/a/", "/mcp/b/"), token), 403, "another agent's nonce");
+	assert.equal(await post(entry.url, "0".repeat(token.length)), 401, "a wrong token");
+	assert.equal(await post(entry.url, token.slice(0, -1)), 401, "a truncated token");
+	assert.equal(await post(entry.url.replace(nonce, otherNonce), token), 401, "the token of another nonce of the same agent");
+	assert.equal(await post(entry.url.replace("/mcp/a/", "/mcp/b/"), token), 401, "the token on another agent's path");
+	assert.equal(await post(otherAgent.url, token), 401, "the token on another agent's session");
+	assert.equal(await post(entry.url.replace(nonce, "0".repeat(32)), token), 401, "an unknown nonce");
 	assert.equal(await post(entry.url.replace(`/${nonce}`, ""), token), 404, "no nonce");
 	server.revoke(nonce);
 	assert.equal(await post(entry.url, token), 403, "a revoked nonce");
+});
+
+/** Sends headers declaring `declared` bytes (or chunked when undefined), then `sent` bytes, without ending the request; waits for the server to close unless `waitClose` is false. */
+async function oversized(url: string, headers: Record<string, string>, sent: number, declared?: number, waitClose = true) {
+	const request = httpRequest(url, { method: "POST", headers: declared === undefined ? headers : { ...headers, "content-length": String(declared) } });
+	request.on("error", () => {});
+	const responded = once(request, "response") as Promise<[IncomingMessage]>;
+	const closed = once(request, "close");
+	if (sent > 0) request.write("x".repeat(sent));
+	else request.flushHeaders();
+	const timeout = setTimeout(() => request.destroy(new Error("no answer")), 2000);
+	const [response] = await responded;
+	response.resume();
+	if (waitClose) await closed;
+	else request.destroy();
+	clearTimeout(timeout);
+	return { status: response.statusCode, finished: request.writableFinished };
+}
+
+test("http MCP answers 413 to a declared oversized body without reading it, and closes the connection", async () => {
+	const server = await startServer([], { maxRequestBytes: 1024 });
+	const endpoint = httpEndpoint(server);
+	const reply = await oversized(endpoint.url, endpoint.headers, 0, 100 * 1024 * 1024);
+	assert.equal(reply.status, 413);
+	assert.equal(reply.finished, false, "answered before the client sent the body");
+	assert.equal((await endpoint.send(listTools)).status, 200);
+});
+
+test("http MCP answers 413 once a chunked body passes the cap, and closes the connection", async () => {
+	const server = await startServer([], { maxRequestBytes: 1024 });
+	const endpoint = httpEndpoint(server);
+	const reply = await oversized(endpoint.url, endpoint.headers, 2048);
+	assert.equal(reply.status, 413);
+	assert.equal(reply.finished, false, "answered before the client ended the body");
+});
+
+test("http MCP refuses an oversized body only after authentication", async () => {
+	const server = await startServer([], { maxRequestBytes: 1024 });
+	const endpoint = httpEndpoint(server);
+	const reply = await oversized(endpoint.url, { ...endpoint.headers, authorization: "Bearer wrong" }, 0, 100 * 1024 * 1024, false);
+	assert.equal(reply.status, 401);
+});
+
+test("stdio MCP refuses another agent's token and closes an oversized handshake line", async () => {
+	const server = await startServer([], { maxRequestBytes: 1024 });
+	const nonce = server.mint("a");
+	const entry = server.serverFor("a", "stdio", nonce);
+	const otherEntry = server.serverFor("b", "stdio", server.mint("b"));
+	assert.ok("args" in entry && "args" in otherEntry);
+	const envOf = (value: typeof entry) => Object.fromEntries(("env" in value ? value.env : []).map((variable) => [variable.name, variable.value]));
+	/** Sends `data` and reports whether the server closed the connection within 300 ms, and what it answered. */
+	const handshake = async (data: string) => {
+		const socket = connect(entry.args[1]!);
+		await once(socket, "connect");
+		socket.on("error", () => {});
+		const replies: string[] = [];
+		createInterface({ input: socket }).on("line", (reply) => replies.push(reply)).on("error", () => {});
+		const closed = once(socket, "close").then(() => true);
+		socket.write(data);
+		const wasClosed = await Promise.race([closed, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 300))]);
+		socket.destroy();
+		return { closed: wasClosed, replies };
+	};
+	const withCall = (hello: object) => `${JSON.stringify(hello)}\n${JSON.stringify(listTools)}\n`;
+	const foreign = await handshake(withCall({ token: envOf(otherEntry).PI_MCP_TOKEN, agent: "a", session: nonce }));
+	assert.equal(foreign.closed, true, "another agent's token");
+	assert.deepEqual(foreign.replies, []);
+	const huge = await handshake(`{"token":"${"x".repeat(8192)}`);
+	assert.equal(huge.closed, true, "an unterminated handshake line over the cap");
+	const good = await handshake(withCall({ token: envOf(entry).PI_MCP_TOKEN, agent: "a", session: nonce }));
+	assert.equal(good.replies.length, 1, "the session's own token");
+	assert.equal(good.closed, false);
 });
 
 test("http MCP refuses a request whose nonce was revoked while its body uploaded", async () => {

@@ -153,9 +153,13 @@ Global keys:
   on the next `tools/list` (stdio connections also get `list_changed`; HTTP
   connections do not, see Known limitations).
   The HTTP transport listens on 127.0.0.1 and the stdio relay uses a socket in
-  a private temp directory; both need a per-process random token. Each ACP
-  session also gets its own nonce (in the HTTP path, or `PI_MCP_SESSION` for
-  the relay). A call is accepted only from the session of the running turn,
+  a private temp directory. Each ACP session gets its own nonce (in the HTTP
+  path, or `PI_MCP_SESSION` for the relay) and its own token, derived from
+  the agent id and nonce with a per-process key and compared in constant
+  time, so a token works only for the agent and session it was issued for
+  (HTTP answers 401 otherwise). Request bodies and relay lines are capped at
+  8 MiB: HTTP answers 413 and closes the connection without reading the rest,
+  and the relay connection is closed. A call is accepted only from the session of the running turn,
   and an ended session's nonce is revoked: HTTP answers 403, its calls still
   running are cancelled, and its relay connections are closed. Over HTTP,
   `initialize` issues an `Mcp-Session-Id`; a cancellation sent in a later

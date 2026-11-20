@@ -8,7 +8,8 @@
  * Tool lists are read live, so a changed Pi loadout is visible on the next
  * `tools/list`; stdio connections are also told with `list_changed`.
  *
- * Two transports, both bound to this machine and guarded by a random token:
+ * Two transports, both bound to this machine. Each session's token is an HMAC of
+ * its agent id and nonce under a per-process key, compared in constant time:
  * - HTTP (MCP Streamable HTTP, JSON responses only) on 127.0.0.1.
  * - stdio: the agent spawns `mcp-relay.mjs`, which pipes its stdin/stdout to a
  *   unix socket (a named pipe on Windows) in a private temp directory. Every
@@ -18,7 +19,7 @@
  * tools/call and request cancellation.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
@@ -32,6 +33,9 @@ import { PI_MCP_SERVER, type McpTransport } from "./config.ts";
 const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const RELAY_PATH = fileURLToPath(new URL("./mcp-relay.mjs", import.meta.url));
 const IS_WINDOWS = process.platform === "win32";
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+/** The relay's handshake line is a few hundred bytes; this bounds what an unauthenticated peer can make Pi buffer. */
+const MAX_HELLO_BYTES = 4096;
 
 export interface McpTool {
 	name: string;
@@ -60,6 +64,8 @@ export interface PiMcpServerOptions {
 	tools: (agentId: string) => McpTool[];
 	call: (call: McpCall) => Promise<McpCallResult>;
 	log?: ((message: string) => void) | undefined;
+	/** The largest HTTP body or stdio line accepted, in bytes; larger ones get 413 or a closed connection. */
+	maxRequestBytes?: number;
 }
 
 /** An ACP `McpServer` entry for `session/new`. */
@@ -117,6 +123,45 @@ export function toMcpTool(tool: { name: string; description: string; parameters:
 	return { name: tool.name, description: [note, tool.description].filter(Boolean).join("\n\n"), inputSchema: schema };
 }
 
+/** Compares two secrets in constant time; hashing first hides their lengths too. */
+function secretsEqual(given: string, expected: string): boolean {
+	const digest = (value: string) => createHash("sha256").update(value).digest();
+	return timingSafeEqual(digest(given), digest(expected));
+}
+
+/** The request body, or null once it exceeds `limit` bytes; the rest is left unread. Rejects when the client aborts. */
+function readBody(request: IncomingMessage, limit: number): Promise<Buffer | null> {
+	const declared = Number(request.headers["content-length"]);
+	if (Number.isFinite(declared) && declared > limit) return Promise.resolve(null);
+	return new Promise((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		let size = 0;
+		const stop = () => {
+			request.off("data", onData).off("end", onEnd).off("error", onError).off("close", onClose);
+			// WARN: an error after we stopped listening would otherwise be an uncaught 'error' event.
+			request.on("error", () => {});
+		};
+		const onData = (chunk: Buffer) => {
+			size += chunk.length;
+			if (size > limit) {
+				stop();
+				request.pause();
+				resolve(null);
+			} else chunks.push(chunk);
+		};
+		const onEnd = () => {
+			stop();
+			resolve(Buffer.concat(chunks));
+		};
+		const onError = (error: Error) => {
+			stop();
+			reject(error);
+		};
+		const onClose = () => onError(new Error("aborted"));
+		request.on("data", onData).on("end", onEnd).on("error", onError).on("close", onClose);
+	});
+}
+
 /** The decoded path segment, or null when it is not valid percent-encoding. */
 function decodePathSegment(segment: string): string | null {
 	try {
@@ -145,7 +190,9 @@ const abortAll = (inflight: Inflight): void => {
 
 export class PiMcpServer {
 	private readonly options: PiMcpServerOptions;
-	private readonly token = randomBytes(24).toString("hex");
+	/** Derives each session's token, so a token is valid only for the agent and nonce it was issued with. */
+	private readonly tokenKey = randomBytes(32);
+	private readonly maxRequestBytes: number;
 	private http: HttpServer | null = null;
 	private httpPort = 0;
 	private socketServer: NetServer | null = null;
@@ -164,12 +211,18 @@ export class PiMcpServer {
 
 	constructor(options: PiMcpServerOptions) {
 		this.options = options;
+		this.maxRequestBytes = options.maxRequestBytes ?? MAX_REQUEST_BYTES;
 	}
 
 	/** Starts both transports once; later calls wait for the first. */
 	start(): Promise<void> {
 		this.started ??= Promise.all([this.startHttp(), this.startSocket()]).then(() => undefined);
 		return this.started;
+	}
+
+	/** The bearer token for `agentId`'s session `nonce`; JSON keeps the two fields from running into each other. */
+	private tokenFor(agentId: string, nonce: string): string {
+		return createHmac("sha256", this.tokenKey).update(JSON.stringify([agentId, nonce])).digest("hex");
 	}
 
 	/** A new session nonce for `agentId`, valid until `revoke`. */
@@ -201,7 +254,7 @@ export class PiMcpServer {
 				type: "http",
 				name: PI_MCP_SERVER,
 				url: `http://127.0.0.1:${this.httpPort}/mcp/${encodeURIComponent(agentId)}/${nonce}`,
-				headers: [{ name: "Authorization", value: `Bearer ${this.token}` }],
+				headers: [{ name: "Authorization", value: `Bearer ${this.tokenFor(agentId, nonce)}` }],
 			};
 		}
 		return {
@@ -210,7 +263,7 @@ export class PiMcpServer {
 			args: [RELAY_PATH, this.socketPath],
 			// The token goes in the environment, which other users cannot read, not in argv.
 			env: [
-				{ name: "PI_MCP_TOKEN", value: this.token },
+				{ name: "PI_MCP_TOKEN", value: this.tokenFor(agentId, nonce) },
 				{ name: "PI_MCP_AGENT", value: agentId },
 				{ name: "PI_MCP_SESSION", value: nonce },
 			],
@@ -321,10 +374,12 @@ export class PiMcpServer {
 	private async serveHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		const match = /^\/mcp\/([^/?]+)\/([^/?]+)/.exec(request.url ?? "");
 		if (!match?.[1] || !match[2]) return void response.writeHead(404).end();
-		if (request.headers.authorization !== `Bearer ${this.token}`) return void response.writeHead(401).end();
 		const agentId = decodePathSegment(match[1]);
 		if (agentId === null) return void response.writeHead(400).end();
 		const nonce = match[2];
+		if (!secretsEqual(request.headers.authorization ?? "", `Bearer ${this.tokenFor(agentId, nonce)}`)) {
+			return void response.writeHead(401).end();
+		}
 		if (this.nonces.get(nonce) !== agentId) return void response.writeHead(403).end();
 		const sessionHeader = request.headers["mcp-session-id"];
 		const sessionKey = typeof sessionHeader === "string" ? sessionHeader : `nonce:${nonce}`;
@@ -340,18 +395,23 @@ export class PiMcpServer {
 		}
 		// No server-initiated stream: the spec allows 405 for GET.
 		if (request.method !== "POST") return void response.writeHead(405, { Allow: "POST, DELETE" }).end();
-		const chunks: Buffer[] = [];
+		let raw: Buffer | null;
 		try {
-			for await (const chunk of request) chunks.push(chunk as Buffer);
+			raw = await readBody(request, this.maxRequestBytes);
 		} catch {
 			// The client went away mid-upload; there is nobody to answer.
 			return void response.destroy();
+		}
+		if (raw === null) {
+			// WARN: the rest of the body is never read; closing the connection is what stops the upload.
+			response.writeHead(413, { Connection: "close" }).end(() => request.destroy());
+			return;
 		}
 		// WHY: the session may have been revoked while the body was uploading.
 		if (this.nonces.get(nonce) !== agentId) return void response.writeHead(403).end();
 		let body: unknown;
 		try {
-			body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+			body = JSON.parse(raw.toString("utf8"));
 		} catch {
 			response.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify(rpcError(null, -32700, "Parse error")));
 			return;
@@ -410,6 +470,13 @@ export class PiMcpServer {
 			this.sockets.delete(socket);
 			for (const controller of inflight.values()) controller.abort();
 		});
+		// WHY: readline buffers a line until its newline arrives, so an endless line would grow without bound.
+		let lineBytes = 0;
+		socket.on("data", (chunk: Buffer) => {
+			const newline = chunk.lastIndexOf(0x0a);
+			lineBytes = newline === -1 ? lineBytes + chunk.length : chunk.length - newline - 1;
+			if (lineBytes > (owner === null ? MAX_HELLO_BYTES : this.maxRequestBytes)) socket.destroy();
+		});
 		const lines = createInterface({ input: socket });
 		// WARN: readline re-emits the socket's errors; without a listener a relay that went away
 		// (EPIPE, ECONNRESET) throws in Pi's process. The socket's own handler already logs them.
@@ -426,9 +493,10 @@ export class PiMcpServer {
 				const hello = isRecord(message) ? message : {};
 				const { agent, session } = hello;
 				if (
-					hello.token !== this.token ||
+					typeof hello.token !== "string" ||
 					typeof agent !== "string" ||
 					typeof session !== "string" ||
+					!secretsEqual(hello.token, this.tokenFor(agent, session)) ||
 					this.nonces.get(session) !== agent
 				) {
 					socket.destroy();
