@@ -157,9 +157,11 @@ Global keys:
   path, or `PI_MCP_SESSION` for the relay) and its own token, derived from
   the agent id and nonce with a per-process key and compared in constant
   time, so a token works only for the agent and session it was issued for
-  (HTTP answers 401 otherwise). Request bodies and relay lines are capped at
-  8 MiB: HTTP answers 413 and closes the connection without reading the rest,
-  and the relay connection is closed. A call is accepted only from the session of the running turn,
+  (HTTP answers 401 otherwise). Request bodies and relay request lines are
+  capped at 8 MiB, and the relay's handshake line, which arrives before the
+  connection is authenticated, at 4 KiB. Past a cap, HTTP answers 413 and
+  closes the connection without reading the rest, and the relay connection is
+  closed before the line is parsed. A call is accepted only from the session of the running turn,
   and an ended session's nonce is revoked: HTTP answers 403, its calls still
   running are cancelled, and its relay connections are closed. Over HTTP,
   `initialize` issues an `Mcp-Session-Id`; a cancellation sent in a later
