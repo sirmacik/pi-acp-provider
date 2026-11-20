@@ -104,6 +104,26 @@ for (const transport of ["stdio", "http"] as const) {
 	});
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+for (const [knob, label] of [
+	["FAKE_MCP_CANCEL", "cancelled its MCP call"],
+	["FAKE_MCP_GIVEUP", "ended the turn without waiting"],
+] as const) {
+	test(`a Pi tool result after the agent ${label} ends the turn with the agent's text`, async () => {
+		const handle = makeProvider([agent({ env: { [knob]: "1" } })]);
+		const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+		const first = await step(handle, messages);
+		assert.equal(first.stopReason, "toolUse");
+		// Pi is still running the tool when the agent stops waiting for it.
+		await sleep(300);
+		messages.push(first, ...(await answerTools(handle, first)));
+		const last = await step(handle, messages);
+		assert.equal(last.stopReason, "stop");
+		assert.match(textOf(last), /AGENT-WENT-ON/);
+	});
+}
+
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_MCP_TITLE: "Run something" } })], { nativeTools: () => true });
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];

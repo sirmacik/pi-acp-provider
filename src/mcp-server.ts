@@ -299,7 +299,11 @@ export class PiMcpServer {
 			this.sockets.delete(socket);
 			for (const controller of inflight.values()) controller.abort();
 		});
-		createInterface({ input: socket }).on("line", (line) => {
+		const lines = createInterface({ input: socket });
+		// WARN: readline re-emits the socket's errors; without a listener a relay that went away
+		// (EPIPE, ECONNRESET) throws in Pi's process. The socket's own handler already logs them.
+		lines.on("error", () => {});
+		lines.on("line", (line) => {
 			let message: unknown;
 			try {
 				message = JSON.parse(line);
@@ -318,7 +322,7 @@ export class PiMcpServer {
 			}
 			const owner = agentId;
 			void this.handle(message, owner, inflight).then((reply) => {
-				if (reply && !socket.destroyed) socket.write(`${JSON.stringify(reply)}\n`);
+				if (reply && socket.writable) socket.write(`${JSON.stringify(reply)}\n`);
 			});
 		});
 	}

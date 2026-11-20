@@ -31,6 +31,9 @@
  *                   then replies "RESULT<<<text>>>" (plus "STEERED<<<text>>>"
  *                   when a _session/steering message arrived meanwhile)
  *   - FAKE_MCP_TITLE=<t> titles that tool call <t> instead
+ *   - FAKE_MCP_CANCEL=1  cancels that MCP call after 50ms (`notifications/cancelled`) and ends the
+ *                   turn with "AGENT-WENT-ON CALL<<<what the call returned>>>"
+ *   - FAKE_MCP_GIVEUP=1  ends the turn after 50ms without waiting for the call
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
  *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
  *   - FAKE_STEERING=1    advertises and accepts `_session/steering`
@@ -97,45 +100,89 @@ let activePrompt = null;
 const sessionParams = new Map();
 const steered = [];
 
-/** A tiny MCP client: initialize, tools/list, tools/call against one ACP McpServer entry. */
-async function mcpCall(server, name, args) {
+/**
+ * A tiny MCP client for one ACP McpServer entry: `request` resolves with the JSON-RPC response,
+ * or `{ error }` when the server refuses or the connection closes.
+ */
+async function openMcp(server) {
 	const init = { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fake-agent", version: "0" } };
+	let client;
 	if (server.type === "http") {
 		const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
 		for (const header of server.headers ?? []) headers[header.name] = header.value;
+		let mcpSession = null;
 		const post = async (body) => {
-			const response = await fetch(server.url, { method: "POST", headers, body: JSON.stringify(body) });
-			return response.status === 202 ? null : response.json();
+			try {
+				const response = await fetch(server.url, {
+					method: "POST",
+					headers: mcpSession ? { ...headers, "mcp-session-id": mcpSession } : headers,
+					body: JSON.stringify(body),
+				});
+				mcpSession = response.headers.get("mcp-session-id") ?? mcpSession;
+				if (response.status === 202) return null;
+				if (!response.ok) return { error: { message: `HTTP ${response.status}` } };
+				return await response.json();
+			} catch (error) {
+				return { error: { message: String(error) } };
+			}
 		};
-		await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: init });
-		await post({ jsonrpc: "2.0", method: "notifications/initialized" });
-		const list = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-		const call = await post({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } });
-		return { tools: list.result.tools, result: call.result };
-	}
-	const env = { ...process.env };
-	for (const entry of server.env ?? []) env[entry.name] = entry.value;
-	const child = spawn(server.command, server.args, { env, stdio: ["pipe", "pipe", "inherit"] });
-	const waiters = new Map();
-	createInterface({ input: child.stdout }).on("line", (line) => {
-		const message = JSON.parse(line);
-		waiters.get(message.id)?.(message);
-	});
-	const request = (id, method, params) =>
-		new Promise((resolve) => {
-			waiters.set(id, resolve);
-			child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+		client = {
+			request: (id, method, params) => post({ jsonrpc: "2.0", id, method, params }),
+			notify: (method, params) => post({ jsonrpc: "2.0", method, params }),
+			close() {},
+		};
+	} else {
+		const env = { ...process.env };
+		for (const entry of server.env ?? []) env[entry.name] = entry.value;
+		const child = spawn(server.command, server.args, { env, stdio: ["pipe", "pipe", "inherit"] });
+		const waiters = new Map();
+		let closed = false;
+		createInterface({ input: child.stdout }).on("line", (line) => {
+			const message = JSON.parse(line);
+			waiters.get(message.id)?.(message);
+			waiters.delete(message.id);
 		});
-	try {
-		await request(1, "initialize", init);
-		child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
-		const list = await request(2, "tools/list", {});
-		const call = await request(3, "tools/call", { name, arguments: args });
-		return { tools: list.result.tools, result: call.result };
-	} finally {
-		child.kill();
+		child.on("exit", () => {
+			closed = true;
+			for (const resolve of waiters.values()) resolve({ error: { message: "connection closed" } });
+			waiters.clear();
+		});
+		const write = (message) => {
+			if (!closed) child.stdin.write(JSON.stringify(message) + "\n");
+		};
+		child.stdin.on("error", () => {});
+		client = {
+			request: (id, method, params) =>
+				closed
+					? Promise.resolve({ error: { message: "connection closed" } })
+					: new Promise((resolve) => {
+							waiters.set(id, resolve);
+							write({ jsonrpc: "2.0", id, method, params });
+						}),
+			notify: (method, params) => write({ jsonrpc: "2.0", method, params }),
+			close: () => child.kill(),
+		};
 	}
+	await client.request(1, "initialize", init);
+	await client.notify("notifications/initialized");
+	return client;
 }
+
+const CALL_ID = 3;
+
+/** Lists the tools, then starts `tools/call`; `result` is the pending call. */
+async function startMcpCall(server, name, args) {
+	const client = await openMcp(server);
+	const list = await client.request(2, "tools/list", {});
+	const result = client.request(CALL_ID, "tools/call", { name, arguments: args });
+	return { client, tools: list.result?.tools ?? [], result };
+}
+
+/** The text of a `tools/call` response, or `error:<message>` when it failed at the protocol level. */
+const callText = (response) =>
+	response.error
+		? `error:${response.error.message}`
+		: (response.result.content ?? []).map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("|");
 
 function serverRequest(method, params) {
 	return new Promise((resolve) => {
@@ -199,9 +246,26 @@ async function handlePrompt(message) {
 			update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NO-MCP-SERVER" } });
 			return turn.finish("end_turn");
 		}
-		const { tools, result } = await mcpCall(server, tool, args);
+		const { client, tools, result: pending } = await startMcpCall(server, tool, args);
+		if (process.env.FAKE_MCP_CANCEL === "1" || process.env.FAKE_MCP_GIVEUP === "1") {
+			// WHY: long enough for the provider to hand the call to Pi before the agent stops waiting.
+			await sleep(50);
+			if (process.env.FAKE_MCP_CANCEL === "1") client.notify("notifications/cancelled", { requestId: CALL_ID, reason: "timeout" });
+			const settled =
+				process.env.FAKE_MCP_CANCEL === "1"
+					? await Promise.race([pending, sleep(300).then(() => ({ error: { message: "still pending" } }))])
+					: { error: { message: "gave up" } };
+			update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "m1", status: "failed" });
+			update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `AGENT-WENT-ON CALL<<<${callText(settled)}>>>` } });
+			turn.finish("end_turn");
+			client.close();
+			return;
+		}
+		const response = await pending;
+		client.close();
+		const result = response.result ?? { content: [{ type: "text", text: callText(response) }], isError: true };
 		update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "m1", status: result.isError ? "failed" : "completed" });
-		const resultText = (result.content ?? []).map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("|");
+		const resultText = callText(response);
 		const extra = steered.length > 0 ? ` STEERED<<<${steered.splice(0).join("|")}>>>` : "";
 		update(sessionId, {
 			sessionUpdate: "agent_message_chunk",

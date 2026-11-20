@@ -342,7 +342,10 @@ interface LiveTurn {
 	/** Prompts to send, in order, once the running one ends (steering the agent could not take mid-turn). */
 	queued: AcpContentBlock[][];
 	tools: Map<string, ToolEntry>;
+	/** Pi tool calls still waiting for Pi's result; the agent may cancel one or end the turn first. */
 	piCalls: Map<string, PiCall>;
+	/** Every Pi tool call this turn handed to Pi: Pi answers each, even once its MCP request is gone. */
+	issued: Set<string>;
 	usage: Usage;
 	/** The agent's latest `usage_update.used`: what its context holds now. */
 	contextUsed: number | undefined;
@@ -611,14 +614,14 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 
+		if (live) {
+			live.controller.abort();
+			live = null;
+		}
 		const users = tail.filter((candidate): candidate is UserMessage => candidate.role === "user");
 		if (users.length === 0) {
 			writer.fail("error", `No user message found to send to ${agent.name}.`);
 			return;
-		}
-		if (live) {
-			live.controller.abort();
-			live = null;
 		}
 		const acp = getClient(agent);
 		const abortedOrError = (error: unknown): void => {
@@ -730,6 +733,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			queued: [],
 			tools: new Map(),
 			piCalls: new Map(),
+			issued: new Set(),
 			usage: zeroUsage(),
 			contextUsed: undefined,
 			onRawUpdate,
@@ -756,7 +760,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return tail.some(
 			(candidate) =>
 				candidate.role === "toolResult" &&
-				(turn.piCalls.has(candidate.toolCallId) || turn.tools.get(candidate.toolCallId)?.mirrored === true),
+				(turn.issued.has(candidate.toolCallId) || turn.tools.get(candidate.toolCallId)?.mirrored === true),
 		);
 	}
 
@@ -893,6 +897,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			notifyWaiters(entry, true);
 		}
 		const id = `pi_${randomUUID()}`;
+		turn.issued.add(id);
 		sync.get(turn.sessionId)?.ours.add(id);
 		return new Promise<McpCallResult>((resolve, reject) => {
 			const onAbort = (): void => {
