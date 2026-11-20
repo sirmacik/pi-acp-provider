@@ -150,7 +150,8 @@ Global keys:
   as the server `pi` (`mcp__pi__<tool>` in Claude Code). A call ends the Pi
   message with a real Pi tool call; Pi runs it and the result answers the
   agent's MCP request, and the ACP turn continues. A changed loadout is served
-  on the next `tools/list` (stdio connections also get `list_changed`).
+  on the next `tools/list` (stdio connections also get `list_changed`; HTTP
+  connections do not, see Known limitations).
   The HTTP transport listens on 127.0.0.1 and the stdio relay uses a socket in
   a private temp directory; both need a per-process random token. Permission
   requests for Pi's tools are approved, since Pi applies its own approval
@@ -216,6 +217,14 @@ Global keys:
 - No ACP client capabilities (`fs`, `terminal`) are offered, so agents use
   their own file and terminal tools. Other agent→client requests get
   method-not-found.
+- Agents connected to Pi's MCP server over HTTP (`mcpTransport: "http"`, the
+  `claude-agent-acp` and `codex-acp` presets) are not told when Pi's tool
+  loadout changes (for example when an extension adds or removes a
+  tool). The server offers no server-to-client stream, so only stdio
+  connections get `notifications/tools/list_changed`. An HTTP agent sees the
+  new tools only when it lists them again, which an agent may do only once per
+  session. Start a new session with `/new` after changing the loadout. Calls
+  to a tool that is no longer served fail with "Pi has no tool named …".
 - Agents without an `ownToolsOffMeta` switch keep their built-in tools in
   isolated summary requests. This includes Codex (`codex-acp`), which has no
   documented ACP setting that turns them off.
