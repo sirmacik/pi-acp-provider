@@ -81,6 +81,7 @@ import {
 	messageKey,
 	renderTranscript,
 	tagged,
+	transcriptOf,
 	userBlocks,
 	type AcpContentBlock,
 } from "./transcript.ts";
@@ -373,7 +374,7 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 			stream.push({ type: "error", reason, error: message });
 		});
 
-	return { append, toolUse, done, fail };
+	return { message, append, toolUse, done, fail };
 }
 
 type MessageWriter = ReturnType<typeof createMessageWriter>;
@@ -445,6 +446,12 @@ interface LiveTurn {
 	/** The session instance the turn set up; its prompts are refused once that one ended. */
 	instance: SessionInstance | undefined;
 	controller: AbortController;
+	/**
+	 * Removes the listener that aborts the turn with the signal of the Pi message last attached.
+	 * WARN: it must outlive that message: while Pi runs a Pi tool call between messages, it is the only
+	 * link that cancels the ACP turn. Only a new `attach`, `settleTurn` or the turn's replacement drops it.
+	 */
+	unbindAbort: (() => void) | undefined;
 	native: boolean;
 	steering: boolean;
 	/** Events that arrived while no Pi message was attached (Pi was running tools). */
@@ -496,6 +503,22 @@ interface SyncState {
 	 * sent again while no own reply follows it.
 	 */
 	seeded: Set<string>;
+	/**
+	 * Timestamp of the newest reply the session streamed to an end Pi keeps in context. Unlike `anchor`,
+	 * it covers the latest reply, so a fork that keeps an earlier one is still seen.
+	 * WHY: `error` replies are left out because Pi omits a retried one from context; `aborted` ones it keeps.
+	 */
+	lastStreamed: number | undefined;
+	/** Keys of the `seeded` messages the accepted seeds rendered: the ones the session actually read. */
+	shown: Set<string>;
+	/**
+	 * Keys of delivered users and `shown` messages that a later request still held, so Pi's history keeps
+	 * them; one missing means the history was edited.
+	 * WHY: a Pi `context` handler may add a message of any role for one request only, and nothing tells it
+	 * from persisted history, so a message counts only once it is seen again. An edit that drops one before
+	 * that goes unnoticed.
+	 */
+	kept: Set<string>;
 	/** The Pi system prompt the session last received. */
 	systemPrompt: string;
 }
@@ -944,6 +967,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 
+		live?.unbindAbort?.();
 		claims.get(key)?.abort();
 		claims.delete(key);
 		lives.delete(key);
@@ -1002,9 +1026,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				ours: new Set(),
 				delivered: new Set(),
 				seeded: new Set(),
+				lastStreamed: undefined,
+				shown: new Set(),
+				kept: new Set(),
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
 			sync.set(turnKey(agent.id, sessionId), state);
+			keepConfirmed(state, messages);
 			info = acp.info ?? (await acp.ensureReady(setupSignal));
 			instance = acp.instance(sessionId);
 			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions, setupSignal, instance);
@@ -1034,7 +1062,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			.filter((candidate) => !isOwn(state, candidate) && !isHeld(candidate) && !requestUsers.has(candidate as UserMessage));
 		/** How much of `history` the session holds once the prompt is accepted. */
 		let heldHistory = history.length;
-		const transcript = renderTranscript(unseen);
+		const { text: transcript, shown } = transcriptOf(unseen);
 		if (transcript) {
 			const intro = "Earlier messages of this Pi conversation that you have not seen, oldest first. Treat them as history, not as new requests:";
 			parts.push(
@@ -1042,6 +1070,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					[tagged("conversation-history", transcript, intro)],
 					() => {
 						for (const seen of unseen) state.seeded.add(messageKey(seen));
+						for (const seen of shown) state.shown.add(messageKey(seen));
 					},
 					// WHY: the anchor must stay before history the session never got, or later prompts skip it.
 					{ omit: () => (heldHistory = history.indexOf(unseen[0]!)) },
@@ -1113,6 +1142,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			sessionId,
 			instance,
 			controller: claim,
+			unbindAbort: undefined,
 			native: options.nativeTools?.() === true,
 			steering: info.capabilities.steering,
 			buffer: [],
@@ -1136,15 +1166,34 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	/**
-	 * Whether Pi's history no longer holds what the session saw: its newest reply
-	 * seen there is gone (a tree jump or fork to an earlier point) or the first
-	 * message changed (compaction). Messages an extension adds for one request
-	 * only do not count, since they are never the session's replies.
+	 * Whether Pi's history no longer holds what the session saw: the first message
+	 * changed (compaction), or a tree jump, fork or context edit dropped the
+	 * session's latest reply, the anchor, or accepted history in `kept`. Messages an
+	 * extension adds for one request only do not count.
 	 */
 	function diverged(state: SyncState, messages: readonly Message[]): boolean {
 		if (state.first !== undefined && messages[0] && messageKey(messages[0]) !== state.first) return true;
-		if (state.anchor === undefined) return false;
-		return !messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
+		const hasReply = (timestamp: number): boolean =>
+			messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === timestamp);
+		if (state.anchor !== undefined && !hasReply(state.anchor)) return true;
+		if (state.lastStreamed !== undefined && !hasReply(state.lastStreamed)) return true;
+		const keys = new Set(messages.map(messageKey));
+		return [...state.kept].some((key) => !keys.has(key));
+	}
+
+	/** Adds to `kept` what earlier requests delivered or showed the session that Pi's history still holds. */
+	function keepConfirmed(state: SyncState, messages: readonly Message[]): void {
+		for (const message of messages) {
+			const key = messageKey(message);
+			if (state.delivered.has(key) || state.shown.has(key)) state.kept.add(key);
+		}
+	}
+
+	/** Records the turn's settled Pi message as the session's latest reply, if Pi keeps it in context. */
+	function noteStreamed(turn: LiveTurn, message: AssistantMessage): void {
+		const state = sync.get(turn.sessionId);
+		if (!state?.ownStamps.has(message.timestamp) || message.stopReason === "error") return;
+		state.lastStreamed = message.timestamp;
 	}
 
 	/** Whether the messages Pi added answer tool calls of `turn`, so the same ACP turn goes on. */
@@ -1377,16 +1426,27 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
+	/** Makes `signal` abort the turn, in place of the signal it was bound to. */
+	function bindAbort(turn: LiveTurn, signal: AbortSignal | undefined): void {
+		turn.unbindAbort?.();
+		turn.unbindAbort = undefined;
+		if (signal?.aborted) turn.controller.abort();
+		if (!signal || signal.aborted) return;
+		const onAbort = (): void => turn.controller.abort();
+		signal.addEventListener("abort", onAbort, { once: true });
+		turn.unbindAbort = () => signal.removeEventListener("abort", onAbort);
+	}
+
 	/** Streams the turn into one Pi message until the next tool call or the end of the turn. */
 	function attach(turn: LiveTurn, writer: MessageWriter, signal: AbortSignal | undefined): void {
-		if (signal?.aborted) turn.controller.abort();
-		else signal?.addEventListener("abort", () => turn.controller.abort(), { once: true });
+		bindAbort(turn, turn.outcome ? undefined : signal);
 		const renderTool = createToolRenderer((text) => writer.append("text", text));
 		let ended = false;
 		const endAt = (toolCall: ToolCall): void => {
 			ended = true;
 			turn.attached = null;
 			writer.toolUse(toolCall);
+			noteStreamed(turn, writer.message);
 		};
 		const consume = (event: TurnEvent): void => {
 			if (ended) return;
@@ -1432,6 +1492,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				}
 			} else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
 			else finishTurn(writer, turn.agent, outcome.result.stopReason, turn.usage);
+			noteStreamed(turn, writer.message);
 		};
 		while (turn.buffer.length > 0 && !ended) consume(turn.buffer.shift()!);
 		if (ended) return;
@@ -1453,6 +1514,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		// Their steers stay in `pendingSteers`, for the next prompt.
 		turn.queued.length = 0;
+		bindAbort(turn, undefined);
 		turn.outcome = outcome;
 		// Mirrored calls the agent never finalized end with what it last reported.
 		for (const entry of turn.tools.values()) notifyWaiters(entry, true);

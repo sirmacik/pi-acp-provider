@@ -81,15 +81,24 @@ function renderMessage(message: Message): string | null {
 
 /** Plain-text transcript of `messages`, newest last, capped from the oldest end. */
 export function renderTranscript(messages: readonly Message[]): string {
-	const parts = messages.flatMap((message) => renderMessage(message) ?? []);
+	return transcriptOf(messages).text;
+}
+
+/** `renderTranscript`, with the messages the text shows: not those with nothing to show or cut by the cap. */
+export function transcriptOf(messages: readonly Message[]): { text: string; shown: Message[] } {
+	const parts = messages.flatMap((message) => {
+		const text = renderMessage(message);
+		return text === null ? [] : [{ message, text }];
+	});
 	let total = 0;
 	let start = parts.length;
-	while (start > 0 && total + (parts[start - 1]?.length ?? 0) <= MAX_TRANSCRIPT_CHARS) {
-		total += (parts[start - 1]?.length ?? 0) + 2;
+	while (start > 0 && total + (parts[start - 1]?.text.length ?? 0) <= MAX_TRANSCRIPT_CHARS) {
+		total += (parts[start - 1]?.text.length ?? 0) + 2;
 		start--;
 	}
 	const omitted = start > 0 ? `[${start} earlier message(s) omitted]\n\n` : "";
-	return omitted + parts.slice(start).join("\n\n");
+	const shown = parts.slice(start);
+	return { text: omitted + shown.map((part) => part.text).join("\n\n"), shown: shown.map((part) => part.message) };
 }
 
 /** Wraps `body` in a tag so the agent can tell context Pi adds from what the user typed. */

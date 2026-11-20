@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -156,6 +157,32 @@ async function abortedStep(handle: AcpProviderHandle, messages: Message[]): Prom
 	assert.ok(last?.type === "error" && last.reason === "aborted", `expected aborted, got ${JSON.stringify(last)}`);
 	return last.error;
 }
+
+test("aborting Pi's run while it runs a Pi tool call aborts the ACP turn and answers the MCP request with an error", async () => {
+	const handle = makeProvider([agent()]);
+	const controller = new AbortController();
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages, undefined, { signal: controller.signal });
+	assert.equal(first.stopReason, "toolUse");
+	const call = first.content.find((block) => block.type === "toolCall");
+	assert.ok(call?.type === "toolCall");
+	controller.abort();
+	const aborted = { role: "toolResult", toolCallId: call.id, toolName: call.name, content: [{ type: "text", text: "Operation aborted" }], isError: true, timestamp: ++clock } as Message;
+	messages.push(first, aborted, user("ECHO CALLREPORT after"));
+	const next = textOf(await step(handle, messages));
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO CALLREPORT after>>> CANCELLEDCALL<<<The turn ended before Pi ran this tool\.>>>$/);
+});
+
+test("a turn spanning several Pi messages leaves no abort listener on Pi's signal once it ends", async () => {
+	const handle = makeProvider([agent()]);
+	const controller = new AbortController();
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
+	const first = await step(handle, messages, undefined, { signal: controller.signal });
+	assert.equal(first.stopReason, "toolUse");
+	messages.push(first, ...(await answerTools(handle, first)));
+	assert.equal((await step(handle, messages, undefined, { signal: controller.signal })).stopReason, "stop");
+	assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
 
 test("a cancelled prompt's late updates, permission requests and MCP calls stay out of the next turn", async () => {
 	const asked: string[] = [];
@@ -482,6 +509,112 @@ test("a continued conversation sends only the new message; a rewritten one start
 	const branched = textOf(await step(handle, [messages[0]!, { ...(first as AssistantMessage), timestamp: ++clock }, user("ECHO other")]));
 	assert.notEqual(/ECHO\[(.+?)\]/.exec(branched)?.[1], session);
 	assert.match(branched, /<conversation-history>[\s\S]*ECHO one/);
+});
+
+const sessionOf = (message: AssistantMessage) => /ECHO\[(.+?)\]/.exec(textOf(message))?.[1];
+
+test("a fork that keeps an earlier reply but drops the latest one starts a new session seeded up to the fork", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const second = await step(handle, messages);
+	assert.equal(sessionOf(second), sessionOf(first));
+	const forked = await capture(handle, [...messages.slice(0, 2), user("ECHO three")]);
+	assert.equal(forked.message.stopReason, "stop");
+	assert.notEqual(sessionOf(forked.message), sessionOf(first));
+	assert.match(forked.prompt, /^<conversation-history>[\s\S]*ECHO one[\s\S]*<\/conversation-history>\nECHO three$/);
+	assert.doesNotMatch(forked.prompt, /ECHO two/);
+});
+
+test("a fork that drops an aborted latest reply and its user starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("SLOW two"));
+	messages.push(await abortAtText(handle, messages));
+	const forked = await capture(handle, [...messages.slice(0, 2), user("ECHO three")]);
+	assert.equal(forked.message.stopReason, "stop");
+	assert.notEqual(sessionOf(forked.message), sessionOf(first));
+	assert.doesNotMatch(forked.prompt, /SLOW two/);
+});
+
+test("a context edit that drops a user a later request still held starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	messages.push(await step(handle, messages), user("ECHO two"));
+	messages.push(await step(handle, messages), user("ECHO three"));
+	const third = await step(handle, messages);
+	assert.equal(sessionOf(third), "sess-1");
+	const edited = await capture(handle, [...messages.filter((message) => message !== messages[2]), third, user("ECHO four")]);
+	assert.equal(edited.message.stopReason, "stop");
+	assert.notEqual(sessionOf(edited.message), "sess-1");
+});
+
+test("a context edit that drops a seeded foreign reply a later request still held starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("earlier question"), foreignReply("answer from another model"), user("ECHO two")];
+	const second = await step(handle, messages);
+	assert.match(textOf(second), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*answer from another model/);
+	messages.push(second, user("ECHO three"));
+	const third = await step(handle, messages);
+	assert.match(textOf(third), /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+	const edited = await capture(handle, [...messages.filter((message) => message !== messages[1]), third, user("ECHO four")]);
+	assert.equal(edited.message.stopReason, "stop");
+	assert.notEqual(sessionOf(edited.message), "sess-1");
+	assert.match(edited.prompt, /^<conversation-history>\n[^\n]*\n\n\[user\]\nearlier question\n\n\[user\]\nECHO two\n\n\[assistant\]\nECHO\[sess-1\]/, "the seed goes from the first user straight to the next one");
+});
+
+test("user messages a context handler adds for one request only do not start a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const injected = await step(handle, [messages[0]!, user("one-shot note in history"), first, messages[2]!, user("one-shot note after")]);
+	assert.match(textOf(injected), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*one-shot note in history[\s\S]*ECHO twoone-shot note after>>>$/);
+	messages.push(injected, user("ECHO three"));
+	const next = textOf(await step(handle, messages));
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+});
+
+test("an assistant reply a context handler adds for one request only does not start a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const injected = await step(handle, [messages[0]!, foreignReply("one-shot synthetic reply"), first, messages[2]!]);
+	assert.match(textOf(injected), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*one-shot synthetic reply[\s\S]*<\/conversation-history>ECHO two>>>$/);
+	messages.push(injected, user("ECHO three"));
+	const next = textOf(await step(handle, messages));
+	assert.match(next, /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+});
+
+test("seeded replies the transcript left out do not count as removed history", async () => {
+	const handle = makeProvider([agent()]);
+	const huge = foreignReply(`HUGE ${"x".repeat(130_000)}`);
+	const thinking = { ...(foreignReply("") as AssistantMessage), content: [{ type: "thinking", thinking: "hidden thoughts" }] } as Message;
+	const messages: Message[] = [user("earlier question"), huge, thinking, foreignReply("answer from another model"), user("ECHO two")];
+	const second = await step(handle, messages);
+	assert.match(textOf(second), /^ECHO\[sess-1\]<<<<conversation-history>[\s\S]*\[2 earlier message\(s\) omitted\][\s\S]*answer from another model/);
+	assert.doesNotMatch(textOf(second), /HUGE|hidden thoughts/);
+	messages.push(second, user("ECHO three"));
+	const third = await step(handle, messages);
+	assert.match(textOf(third), /^ECHO\[sess-1\]<<<ECHO three>>>$/);
+	messages.push(third, user("ECHO four"));
+	const edited = textOf(await step(handle, messages.filter((message) => message !== huge && message !== thinking)));
+	assert.match(edited, /^ECHO\[sess-1\]<<<ECHO four>>>$/);
+});
+
+test("compaction, which replaces the first message, starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const second = await step(handle, messages);
+	const compacted = await capture(handle, [user("summary of the conversation so far"), second, user("ECHO three")]);
+	assert.equal(compacted.message.stopReason, "stop");
+	assert.notEqual(sessionOf(compacted.message), sessionOf(first));
+	assert.match(compacted.prompt, /^<conversation-history>[\s\S]*summary of the conversation so far[\s\S]*<\/conversation-history>\nECHO three$/);
 });
 
 test("steering reaches the running turn with _session/steering before the tool result", async () => {
