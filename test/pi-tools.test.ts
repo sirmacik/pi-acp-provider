@@ -106,9 +106,10 @@ for (const transport of ["stdio", "http"] as const) {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-for (const [knob, label] of [
-	["FAKE_MCP_CANCEL", "cancelled its MCP call"],
-	["FAKE_MCP_GIVEUP", "ended the turn without waiting"],
+for (const [knob, label, call] of [
+	// The cancellation must have reached the provider, which rejects the call; not a call left pending.
+	["FAKE_MCP_CANCEL", "cancelled its MCP call", /CALL<<<The tool call was cancelled\.>>>/],
+	["FAKE_MCP_GIVEUP", "ended the turn without waiting", /CALL<<<error:gave up>>>/],
 ] as const) {
 	test(`a Pi tool result after the agent ${label} ends the turn with the agent's text`, async () => {
 		const handle = makeProvider([agent({ env: { [knob]: "1" } })]);
@@ -121,6 +122,7 @@ for (const [knob, label] of [
 		const last = await step(handle, messages);
 		assert.equal(last.stopReason, "stop");
 		assert.match(textOf(last), /AGENT-WENT-ON/);
+		assert.match(textOf(last), call);
 	});
 }
 
