@@ -432,7 +432,14 @@ interface PendingSteer {
 	rejections: number;
 }
 
+/** One key from an agent id and a conversation or session id. */
+const turnKey = (agentId: string, id: string): string => `${agentId}\u0000${id}`;
+
 interface LiveTurn {
+	/** `turnKey(agent id, conversation)`: the turn's slot in `lives` and its pending steers. */
+	key: string;
+	/** Pi's `StreamOptions.sessionId`; "" when Pi sent none. */
+	conversation: string;
 	agent: AcpAgentConfig;
 	modelId: string;
 	acp: AcpClient;
@@ -585,7 +592,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	let cwd = process.cwd();
 	/** One client (and agent process) per agent, spawned on first use. */
 	const clients = new Map<string, AcpClient>();
-	/** What each ACP session has seen, by session id. */
+	/** What each ACP session has seen, by `turnKey(agent id, session id)`: session ids collide across agents. */
 	const sync = new Map<string, SyncState>();
 	/** The tools served to each agent, from the latest Pi context. */
 	const served = new Map<string, McpTool[]>();
@@ -601,15 +608,17 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!wiring) sessionWiring.set(client, (wiring = new Map()));
 		return wiring;
 	};
-	/** The ACP turn in progress; it spans several Pi messages. */
-	let live: LiveTurn | null = null;
+	/** The ACP turns in progress, by `LiveTurn.key`; each spans several Pi messages. */
+	const lives = new Map<string, LiveTurn>();
 	/**
 	 * Steers the agent has not accepted yet, and users an `onPayload` hook left out of an accepted prompt,
-	 * oldest first, by agent id. Kept here rather than in a
+	 * oldest first, by `LiveTurn.key`. Kept here rather than in a
 	 * `SyncState`, so they outlive a replaced or re-seeded session and reach its next prompt.
-	 * TODO(ticket-011): key them by conversation once sessions are.
 	 */
 	const pendingSteers = new Map<string, PendingSteer[]>();
+	const liveOn = (client: AcpClient, sessionId: string | undefined): LiveTurn | undefined =>
+		[...lives.values()].find((turn) => turn.acp === client && turn.sessionId === sessionId);
+	const syncOf = (turn: LiveTurn): SyncState | undefined => sync.get(turnKey(turn.agent.id, turn.sessionId));
 
 	const answerServerRequest = async (
 		agent: AcpAgentConfig,
@@ -642,12 +651,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * never use them here.
 	 */
 	function isPiToolPermission(agent: AcpAgentConfig, client: AcpClient, sessionId: string | undefined, params: unknown): boolean {
-		const turn = live;
+		const turn = liveOn(client, sessionId);
 		if (
 			!turn ||
-			turn.acp !== client ||
 			turn.agent.id !== agent.id ||
-			sessionId !== turn.sessionId ||
 			!turn.accepting ||
 			turn.outcome ||
 			turn.controller.signal.aborted
@@ -674,7 +681,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** Forgets an ended session of `agent`'s main client and revokes its MCP nonces. */
 	function endSession(agent: AcpAgentConfig, client: AcpClient, sessionId: string): void {
-		sync.delete(sessionId);
+		sync.delete(turnKey(agent.id, sessionId));
 		wiringOf(client).delete(sessionId);
 		for (const [nonce, owner] of nonceSessions) {
 			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
@@ -813,30 +820,30 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		return message.role === "user" && state.delivered.has(messageKey(message));
 	}
 
-	const isPendingSteer = (agentId: string, key: string): boolean =>
-		pendingSteers.get(agentId)?.some((steer) => steer.key === key) === true;
+	const isPendingSteer = (owner: string, key: string): boolean =>
+		pendingSteers.get(owner)?.some((steer) => steer.key === key) === true;
 
 	/** Holds `steers` until a prompt carrying them is accepted. */
-	function holdSteers(agentId: string, steers: readonly UserMessage[]): void {
-		const held = pendingSteers.get(agentId) ?? [];
+	function holdSteers(owner: string, steers: readonly UserMessage[]): void {
+		const held = pendingSteers.get(owner) ?? [];
 		for (const message of steers) {
 			const key = messageKey(message);
 			if (!held.some((steer) => steer.key === key)) held.push({ message, key, rejections: 0 });
 		}
-		pendingSteers.set(agentId, held);
+		pendingSteers.set(owner, held);
 	}
 
 	/** Records the steers `keys` as delivered to the session. */
-	function deliverSteers(agentId: string, state: SyncState | undefined, keys: readonly string[]): void {
+	function deliverSteers(owner: string, state: SyncState | undefined, keys: readonly string[]): void {
 		for (const key of keys) state?.delivered.add(key);
-		const held = pendingSteers.get(agentId);
-		if (held) pendingSteers.set(agentId, held.filter((steer) => !keys.includes(steer.key)));
+		const held = pendingSteers.get(owner);
+		if (held) pendingSteers.set(owner, held.filter((steer) => !keys.includes(steer.key)));
 	}
 
 	/** Counts a rejection of the steers `keys`; returns the ones this rejection dropped. */
-	function rejectSteers(agentId: string, keys: readonly string[]): PendingSteer[] {
+	function rejectSteers(owner: string, keys: readonly string[]): PendingSteer[] {
 		const dropped: PendingSteer[] = [];
-		for (const steer of pendingSteers.get(agentId) ?? []) {
+		for (const steer of pendingSteers.get(owner) ?? []) {
 			if (!keys.includes(steer.key)) continue;
 			steer.rejections++;
 			if (steer.rejections === MAX_STEER_REJECTIONS) dropped.push(steer);
@@ -847,13 +854,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const isDropped = (steer: PendingSteer): boolean => steer.rejections >= MAX_STEER_REJECTIONS;
 
 	/**
-	 * The agent's pending steers still on Pi's active branch and undelivered to the session; forgets the rest.
+	 * The pending steers of the turn key `owner` still on Pi's active branch and undelivered to the session; forgets the rest.
 	 * WARN: dropped steers stay listed, unsent, so that they stay out of history seeds as well.
 	 */
-	function recoverSteers(agentId: string, messages: readonly Message[], state: SyncState): PendingSteer[] {
+	function recoverSteers(owner: string, messages: readonly Message[], state: SyncState): PendingSteer[] {
 		const branch = new Set(messages.map(messageKey));
-		const kept = (pendingSteers.get(agentId) ?? []).filter((steer) => branch.has(steer.key) && !state.delivered.has(steer.key));
-		pendingSteers.set(agentId, kept);
+		const kept = (pendingSteers.get(owner) ?? []).filter((steer) => branch.has(steer.key) && !state.delivered.has(steer.key));
+		pendingSteers.set(owner, kept);
 		return kept;
 	}
 
@@ -896,17 +903,23 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 		const messages = conversation(context.messages);
 		const tail = messages.slice(tailStart(messages));
-		if (live && live.agent.id === agent.id && !live.controller.signal.aborted && continuesLiveTurn(live, tail)) {
-			sync.get(live.sessionId)?.ownStamps.add(message.timestamp);
+		const conversationId = streamOptions?.sessionId ?? "";
+		const key = turnKey(agent.id, conversationId);
+		const live = lives.get(key);
+		if (live && !live.controller.signal.aborted && continuesLiveTurn(live, tail)) {
+			syncOf(live)?.ownStamps.add(message.timestamp);
 			stream.push({ type: "start", partial: message });
 			await continueTurn(live, tail);
 			attach(live, writer, signal);
 			return;
 		}
 
-		if (live) {
-			live.controller.abort();
-			live = null;
+		// WHY: a Pi conversation runs one request at a time, so a new one replaces its turn on any agent;
+		// requests without a conversation id share no conversation and leave other agents' turns alone.
+		for (const [otherKey, other] of lives) {
+			if (otherKey !== key && (conversationId === "" || other.conversation !== conversationId)) continue;
+			other.controller.abort();
+			lives.delete(otherKey);
 		}
 		const users = messages
 			.slice(requestStart(messages))
@@ -931,8 +944,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			const server = await mcpServer(agent);
 			let promptInSession = false;
 			const setup = sessionSetup(agent, acp, server, systemPrompt, () => (promptInSession = true));
-			sessionId = await acp.ensureSession({ signal, setup });
-			let known = sync.get(sessionId);
+			sessionId = await acp.ensureSession({ signal, setup, conversation: conversationId });
+			let known = sync.get(turnKey(agent.id, sessionId));
 			// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
 			// down would never gain Pi's tools; a new session seeded from Pi's history does.
 			const rewired = wiringOf(acp).get(sessionId) !== setup.key;
@@ -942,10 +955,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 						? `${agent.id}: session ${sessionId} lacks Pi's tool wiring (${setup.key}); starting a new session`
 						: `${agent.id}: Pi history diverged from session ${sessionId}; starting a new session`,
 				);
-				sync.delete(sessionId);
-				acp.resetSession(cwd);
+				sync.delete(turnKey(agent.id, sessionId));
+				acp.resetSession(cwd, conversationId);
 				promptInSession = false;
-				sessionId = await acp.ensureSession({ signal, setup });
+				sessionId = await acp.ensureSession({ signal, setup, conversation: conversationId });
 				known = undefined;
 			}
 			state = known ?? {
@@ -957,7 +970,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				seeded: new Set(),
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
-			sync.set(sessionId, state);
+			sync.set(turnKey(agent.id, sessionId), state);
 			info = acp.info ?? (await acp.ensureReady(signal));
 			await applySettings(acp, agent, sessionId, target.modelId, model, streamOptions);
 		} catch (error) {
@@ -972,7 +985,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				: "Instructions from Pi, the host application you run in. Follow them together with your own:";
 			parts.push(promptPart([tagged("system-instructions", systemPrompt, intro)], () => (state.systemPrompt = systemPrompt)));
 		}
-		const held = recoverSteers(agent.id, messages, state);
+		const held = recoverSteers(key, messages, state);
 		const isHeld = (candidate: Message): boolean => held.some((steer) => steer.key === messageKey(candidate));
 		const late = held.filter((steer) => !isDropped(steer));
 		const requestUsers = new Set(users);
@@ -1001,7 +1014,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		if (late.length > 0) parts.push(promptPart([{ type: "text", text: LATE_STEER_NOTE }], () => {}));
 		for (const steer of late) {
-			const record = (): void => deliverSteers(agent.id, state, [steer.key]);
+			const record = (): void => deliverSteers(key, state, [steer.key]);
 			parts.push(promptPart(userBlocks(steer.message, info.capabilities.image), record, { steer: steer.key }));
 		}
 		const sendable = users.filter((user) => !isHeld(user));
@@ -1015,7 +1028,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		for (const user of sentUsers) {
 			// WHY: once the agent answers, a user the hook left out falls behind the reply and would reach the
 			// next prompt only as history; held, it goes as a late user block instead.
-			const omit = (): void => holdSteers(agent.id, [user]);
+			const omit = (): void => holdSteers(key, [user]);
 			parts.push(promptPart(userBlocks(user, info.capabilities.image), () => state.delivered.add(messageKey(user)), { omit }));
 		}
 		const blocks = parts.flatMap((part) => part.blocks);
@@ -1049,6 +1062,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const sentSteers = sent.flatMap((part) => (part.steer === undefined ? [] : [part.steer]));
 
 		const turn: LiveTurn = {
+			key,
+			conversation: conversationId,
 			agent,
 			modelId: model.id,
 			acp,
@@ -1070,7 +1085,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			onRawUpdate,
 			notice: undefined,
 		};
-		live = turn;
+		lives.set(key, turn);
 		startPrompt(turn, { payload, commit, steers: sentSteers });
 		attach(turn, writer, signal);
 	}
@@ -1101,13 +1116,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * the steering messages Pi queued after them.
 	 */
 	async function continueTurn(turn: LiveTurn, tail: readonly Message[]): Promise<void> {
-		const state = sync.get(turn.sessionId);
+		const state = syncOf(turn);
 		const results = tail.filter(
 			(candidate): candidate is ToolResultMessage => candidate.role === "toolResult" && turn.piCalls.has(candidate.toolCallId),
 		);
 		const steers = tail.filter(
 			(candidate): candidate is UserMessage =>
-				candidate.role === "user" && !state?.delivered.has(messageKey(candidate)) && !isPendingSteer(turn.agent.id, messageKey(candidate)),
+				candidate.role === "user" && !state?.delivered.has(messageKey(candidate)) && !isPendingSteer(turn.key, messageKey(candidate)),
 		);
 		const steerKeys = steers.map(messageKey);
 		const image = turn.acp.info?.capabilities.image === true;
@@ -1118,7 +1133,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!steerDelivered && turn.steering && turn.running) {
 			try {
 				steerDelivered = (await turn.acp.steer(turn.sessionId, steerBlocks)) === "steered";
-				if (steerDelivered) deliverSteers(turn.agent.id, state, steerKeys);
+				if (steerDelivered) deliverSteers(turn.key, state, steerKeys);
 			} catch (error) {
 				log?.(`${turn.agent.id}: _session/steering failed, falling back: ${errorMessage(error)}`);
 			}
@@ -1142,15 +1157,15 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					...images,
 				);
 				steerDelivered = true;
-				deliverSteers(turn.agent.id, state, steerKeys);
+				deliverSteers(turn.key, state, steerKeys);
 			}
 			call.resolve(reply);
 		}
 		if (steerDelivered) return;
-		holdSteers(turn.agent.id, steers);
+		holdSteers(turn.key, steers);
 		enqueuePrompt(turn, {
 			payload: { sessionId: turn.sessionId, prompt: steerBlocks },
-			commit: () => deliverSteers(turn.agent.id, sync.get(turn.sessionId), steerKeys),
+			commit: () => deliverSteers(turn.key, syncOf(turn), steerKeys),
 			steers: steerKeys,
 		});
 	}
@@ -1202,7 +1217,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** Counts the agent's rejection of `prompt` against its steers; tells the user about the ones dropped. */
 	function rejectPrompt(turn: LiveTurn, prompt: TurnPrompt): void {
-		const dropped = rejectSteers(turn.agent.id, prompt.steers);
+		const dropped = rejectSteers(turn.key, prompt.steers);
 		if (dropped.length === 0) return;
 		const quoted = dropped.map((steer) => `"${summarize(plainText(steer.message), 80)}"`).join(", ");
 		turn.notice = `Pi dropped ${dropped.length} steering message(s) that ${turn.agent.name} rejected ${MAX_STEER_REJECTIONS} times: ${quoted}. Send again what still matters.`;
@@ -1254,13 +1269,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 
 	/** An MCP `tools/call` from the agent: becomes a Pi tool call in the running turn. */
 	function handleMcpCall(call: McpCall): Promise<McpCallResult> {
-		const turn = live;
 		const owner = nonceSessions.get(call.nonce);
+		const turn = owner && [...lives.values()].find((candidate) => candidate.agent.id === owner.agentId && candidate.sessionId === owner.sessionId);
 		if (
 			!turn ||
 			turn.agent.id !== call.agentId ||
-			owner?.agentId !== turn.agent.id ||
-			owner.sessionId !== turn.sessionId ||
 			!turn.accepting ||
 			turn.outcome ||
 			turn.controller.signal.aborted
@@ -1286,7 +1299,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		const id = `pi_${randomUUID()}`;
 		turn.issued.add(id);
-		sync.get(turn.sessionId)?.ours.add(id);
+		syncOf(turn)?.ours.add(id);
 		return new Promise<McpCallResult>((resolve, reject) => {
 			const onAbort = (): void => {
 				turn.piCalls.delete(id);
@@ -1341,7 +1354,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				}
 				if (entry.mirrored) return;
 				entry.mirrored = true;
-				sync.get(turn.sessionId)?.ours.add(event.toolCallId);
+				syncOf(turn)?.ours.add(event.toolCallId);
 				endAt({
 					type: "toolCall",
 					id: event.toolCallId,
@@ -1354,7 +1367,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			if (ended) return;
 			ended = true;
 			turn.attached = null;
-			if (live === turn) live = null;
+			if (lives.get(turn.key) === turn) lives.delete(turn.key);
 			if ("error" in outcome) {
 				if (turn.controller.signal.aborted) writer.fail("aborted", "Request was aborted");
 				else {
@@ -1451,7 +1464,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	const awaitTool: AwaitTool = (toolCallId, signal, onPartial) => {
-		const turn = live;
+		// WARN: Pi names only the tool call id, so two live turns mirroring the same id cannot be told apart.
+		const turn = [...lives.values()].find((candidate) => candidate.tools.get(toolCallId)?.mirrored === true);
 		const entry = turn?.tools.get(toolCallId);
 		if (!turn || !entry) {
 			return Promise.resolve({ status: "failed", content: { text: ["This ACP turn is no longer running."], diffs: [], terminals: [] }, rawOutput: undefined });
@@ -1582,8 +1596,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		provider,
 		resetSession(nextCwd: string): void {
 			cwd = nextCwd;
-			live?.controller.abort();
-			live = null;
+			for (const turn of lives.values()) turn.controller.abort();
+			lives.clear();
 			pendingSteers.clear();
 			for (const client of clients.values()) client.resetSession(nextCwd);
 		},
@@ -1591,8 +1605,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		awaitTool,
 		commands: async (agentId) => (await clients.get(agentId)?.currentCommands()) ?? [],
 		dispose(): void {
-			live?.controller.abort();
-			live = null;
+			for (const turn of lives.values()) turn.controller.abort();
+			lives.clear();
 			for (const client of clients.values()) client.dispose();
 			clients.clear();
 			sync.clear();

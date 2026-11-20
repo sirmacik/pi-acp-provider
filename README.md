@@ -137,8 +137,11 @@ Global keys:
   whole tree (including tool subprocesses) is killed. Parent signal hooks,
   shared by all agents, cover exits without a session shutdown. A crashed
   agent is respawned with a fresh session on the next prompt.
-- **Session mapping**: one ACP session per Pi session per agent. The agent
-  keeps the conversation on its side, so each prompt carries only what it has
+- **Session mapping**: one ACP session per Pi session per agent. Pi sessions
+  that stream at the same time in one Pi process (for example an extension's
+  side conversation) run in separate ACP sessions of the same agent process,
+  and neither cancels the other's turn; a new request in a Pi session still
+  replaces that session's own running turn. The agent keeps the conversation on its side, so each prompt carries only what it has
   not seen: every queued user message (with images, when the agent accepts
   them), plus a `<conversation-history>` transcript of any part of Pi's
   history the session missed (a resumed or forked Pi session, another

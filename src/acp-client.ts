@@ -1,8 +1,8 @@
 /**
  * JSON-RPC 2.0 client for an ACP agent over stdio (NDJSON framing).
  *
- * Owns the child process and the ACP session: lazy spawn, memoized
- * `initialize` handshake and `session/new`, one `session/prompt` at a time,
+ * Owns the child process and one ACP session per conversation: lazy spawn, memoized
+ * `initialize` handshake and `session/new`, one `session/prompt` at a time per session,
  * `session/cancel` on abort, and cleanup when the process dies. A crashed
  * process is replaced on next use with a fresh session. Server-initiated
  * requests (tool permissions) are answered by the injected handler.
@@ -116,24 +116,32 @@ interface SessionState {
 	initialModel: string | undefined;
 }
 
+/** The current session of one conversation (`EnsureSessionOptions.conversation`). */
+interface SessionSlot {
+	session: Promise<string> | null;
+	/** The id `session` resolved to. */
+	id: string | undefined;
+	/** `setup.key` the current session was created with; "" for a bare session. */
+	key: string;
+	/** Whether the current session has received a prompt (and so has history). */
+	used: boolean;
+	/** Whether the next session opened replaces one whose cancelled prompt never answered. */
+	replacing: boolean;
+	/** The `session` promise opened while `replacing`, until it settles. */
+	replacement: Promise<string> | null;
+}
+
 interface Connection {
 	proc: ChildProcessWithoutNullStreams;
 	state: "starting" | "ready";
-	session: Promise<string> | null;
-	/** `setup.key` the current session was created with; "" for a bare session. */
-	sessionKey: string;
-	/** Whether the current session has received a prompt (and so has history). */
-	sessionUsed: boolean;
+	/** Each conversation's current session, by conversation. */
+	slots: Map<string, SessionSlot>;
 	/** Every session this process created, by session id. */
 	sessions: Map<string, SessionState>;
 	/** Slash commands the agent advertised, by session id. */
 	commands: Map<string, AcpCommand[]>;
 	/** Sessions of this process that ended; their traffic is dropped or answered `cancelled`. */
 	ended: Set<string>;
-	/** Whether the next session opened replaces one whose cancelled prompt never answered. */
-	replacing: boolean;
-	/** The `session` promise opened while `replacing`, until it settles. */
-	replacement: Promise<string> | null;
 }
 
 export interface EnsureSessionOptions {
@@ -149,6 +157,8 @@ export interface EnsureSessionOptions {
 	 * once it has one.
 	 */
 	setup?: SessionSetup | undefined;
+	/** Which conversation's session: each has its own, so their prompts can run at once (default ""). */
+	conversation?: string | undefined;
 }
 
 export interface SessionSetup {
@@ -271,8 +281,8 @@ export class AcpClient {
 	private readonly drains = new Map<string, Drain>();
 	/** Drain timeouts in a row; a drain that ends in time, or a restart, resets it. */
 	private drainTimeouts = 0;
-	/** A drain-timeout recovery in progress; concurrent `ensureSession` calls share it. */
-	private recovery: Promise<void> | null = null;
+	/** The drain-timeout recovery in progress for each conversation; its concurrent `ensureSession` calls share it. */
+	private readonly recoveries = new Map<string, Promise<void>>();
 
 	constructor(options: AcpClientOptions) {
 		this.options = options;
@@ -297,33 +307,44 @@ export class AcpClient {
 		return abortable(this.ready, signal);
 	}
 
-	/** Returns the current ACP session, creating one (and the process) on demand. */
+	/** Returns the conversation's current ACP session, creating one (and the process) on demand. */
 	async ensureSession(options: EnsureSessionOptions = {}): Promise<string> {
-		const { signal, authenticate = true, setup } = options;
-		this.recovery ??= this.recoverDrain().finally(() => (this.recovery = null));
-		await abortable(this.recovery, signal);
+		const { signal, authenticate = true, setup, conversation = "" } = options;
+		let recovery = this.recoveries.get(conversation);
+		if (!recovery) {
+			const started: Promise<void> = this.recoverDrain(conversation).finally(() => {
+				if (this.recoveries.get(conversation) === started) this.recoveries.delete(conversation);
+			});
+			this.recoveries.set(conversation, (recovery = started));
+		}
+		await abortable(recovery, signal);
 		const info = await this.ensureReady(signal);
 		const conn = this.conn;
 		if (!conn) throw new Error(`${this.options.agent.name} is not running`);
+		let slot = conn.slots.get(conversation);
+		if (!slot) conn.slots.set(conversation, (slot = { session: null, id: undefined, key: "", used: false, replacing: false, replacement: null }));
 		const key = setup?.key ?? "";
-		if (conn.session && setup && conn.sessionKey !== key && !conn.sessionUsed) this.dropSession(conn);
-		if (!conn.session) {
-			conn.sessionKey = key;
+		if (slot.session && setup && slot.key !== key && !slot.used) this.dropSession(conn, slot);
+		let session = slot.session;
+		if (!session) {
+			const owner = slot;
+			owner.key = key;
 			const params = setup?.params(info) ?? {};
-			const session: Promise<string> = this.newSession(conn, authenticate, params).then(
+			const created: Promise<string> = this.newSession(conn, authenticate, params).then(
 				(sessionId) => {
-					if (conn.replacement === session) conn.replacement = null;
+					if (owner.replacement === created) owner.replacement = null;
+					if (owner.session === created) owner.id = sessionId;
 					setup?.settled?.(params, sessionId);
 					return sessionId;
 				},
 				(error: unknown) => {
 					setup?.settled?.(params, undefined);
-					if (conn.session === session) conn.session = null;
+					if (owner.session === created) owner.session = null;
 					// WHY: decided here, on the shared operation, so the restart happens even when every
 					// caller waiting on this session has aborted. An agent that cannot open the session
 					// replacing a stuck one is not trusted to recover by itself.
-					if (conn.replacement === session) {
-						conn.replacement = null;
+					if (owner.replacement === created) {
+						owner.replacement = null;
 						if (this.conn === conn && !this.disposed) {
 							this.log(`new session after a drain timeout failed (${errorText(error)}); restarting the agent`);
 							this.close(conn, new Error("restarted after a drain timeout"));
@@ -332,14 +353,13 @@ export class AcpClient {
 					throw error;
 				},
 			);
-			conn.session = session;
-			if (conn.replacing) {
-				conn.replacing = false;
-				conn.replacement = session;
+			owner.session = session = created;
+			if (owner.replacing) {
+				owner.replacing = false;
+				owner.replacement = created;
 			}
 		}
-		const session = conn.session;
-		const replacement = conn.replacement === session;
+		const replacement = slot.replacement === session;
 		try {
 			return await abortable(session, signal);
 		} catch (error) {
@@ -350,15 +370,16 @@ export class AcpClient {
 	}
 
 	/**
-	 * Waits for the current session's cancelled prompt, if any. When it does not answer within the
-	 * cancel grace, rejects it and ends the session so the next one starts clean; on the second
-	 * timeout in a row restarts the process instead.
+	 * Waits for the conversation's current session's cancelled prompt, if any. When it does not answer
+	 * within the cancel grace, rejects it and ends the session so the next one starts clean; on the
+	 * second timeout in a row restarts the process instead.
 	 */
-	private async recoverDrain(): Promise<void> {
+	private async recoverDrain(conversation: string): Promise<void> {
 		const conn = this.conn;
-		const sessionId = await conn?.session?.catch(() => undefined);
+		const slot = conn?.slots.get(conversation);
+		const sessionId = await slot?.session?.catch(() => undefined);
 		const drain = sessionId === undefined ? undefined : this.drains.get(sessionId);
-		if (!conn || sessionId === undefined || !drain) return;
+		if (!conn || !slot || sessionId === undefined || !drain) return;
 		// A drain that ends in time resets the timeout streak where it settles (in `prompt`).
 		if (await drain.settled) return;
 		if (this.conn !== conn || this.drains.get(sessionId) !== drain) return;
@@ -371,15 +392,16 @@ export class AcpClient {
 			return;
 		}
 		this.log(`session ${sessionId} ignored session/cancel; starting a new session`);
-		this.dropSession(conn);
-		conn.replacing = true;
+		this.dropSession(conn, slot);
+		slot.replacing = true;
 	}
 
-	/** Forgets the current session and ends it once it exists, so its traffic is refused. */
-	private dropSession(conn: Connection): void {
-		const session = conn.session;
-		conn.session = null;
-		conn.sessionUsed = false;
+	/** Forgets the slot's current session and ends it once it exists, so its traffic is refused. */
+	private dropSession(conn: Connection, slot: SessionSlot): void {
+		const session = slot.session;
+		slot.session = null;
+		slot.id = undefined;
+		slot.used = false;
 		void session?.then(
 			(sessionId) => this.endSession(conn, sessionId),
 			() => {},
@@ -421,11 +443,15 @@ export class AcpClient {
 		return parseSteerOutcome(result);
 	}
 
-	/** Slash commands the current session advertised (`available_commands_update`). */
+	/** Slash commands the newest conversation's current session advertised (`available_commands_update`). */
 	async currentCommands(): Promise<AcpCommand[]> {
 		const conn = this.conn;
-		const sessionId = await conn?.session?.catch(() => undefined);
-		return (sessionId && conn?.commands.get(sessionId)) || [];
+		for (const slot of [...(conn?.slots.values() ?? [])].reverse()) {
+			const sessionId = await slot.session?.catch(() => undefined);
+			const commands = sessionId === undefined ? undefined : conn?.commands.get(sessionId);
+			if (commands) return commands;
+		}
+		return [];
 	}
 
 	/** The models and reasoning levels a live session offers. */
@@ -461,15 +487,19 @@ export class AcpClient {
 	}
 
 	/**
-	 * Forgets the current session; the next `ensureSession` creates one in
-	 * `cwd`. An unused session in the same directory is kept: it has no
-	 * history, so it is as good as a new one.
+	 * Forgets the current session of `conversation`, or of every conversation; the next `ensureSession`
+	 * creates one in `cwd`. An unused session in the same directory is kept: it has no history, so it is
+	 * as good as a new one.
 	 */
-	resetSession(cwd: string): void {
+	resetSession(cwd: string, conversation?: string): void {
 		const unchanged = cwd === this.cwd;
 		this.cwd = cwd;
-		if (!this.conn || (unchanged && !this.conn.sessionUsed)) return;
-		this.dropSession(this.conn);
+		const conn = this.conn;
+		if (!conn) return;
+		for (const [name, slot] of conn.slots) {
+			if (conversation !== undefined && name !== conversation) continue;
+			if (!unchanged || slot.used) this.dropSession(conn, slot);
+		}
 	}
 
 	/** Sends one `session/prompt` and resolves when the turn finishes or is aborted. */
@@ -477,7 +507,7 @@ export class AcpClient {
 		const { sessionId, signal } = request;
 		if (this.busy.has(sessionId)) throw new Error(`Another ${this.options.agent.name} prompt is already in flight`);
 		this.busy.add(sessionId);
-		if (this.conn) this.conn.sessionUsed = true;
+		for (const slot of this.conn?.slots.values() ?? []) if (slot.id === sessionId) slot.used = true;
 		try {
 			if (!(await this.drained(sessionId))) {
 				throw new Error(`${this.options.agent.name} session ${sessionId} is still running a cancelled prompt; open a new session`);
@@ -592,14 +622,10 @@ export class AcpClient {
 		const conn: Connection = {
 			proc,
 			state: "starting",
-			session: null,
-			sessionKey: "",
-			sessionUsed: false,
+			slots: new Map(),
 			sessions: new Map(),
 			commands: new Map(),
 			ended: new Set(),
-			replacing: false,
-			replacement: null,
 		};
 		this.conn = conn;
 		track(proc);

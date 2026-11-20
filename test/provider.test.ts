@@ -265,6 +265,70 @@ test("agents run as separate processes with separate sessions", async () => {
 	assert.equal(second.message.model, "other");
 });
 
+/** Streams a SLOW prompt with `first`, and once it is under way an ECHO prompt with `second`; both to completion. */
+async function overlapping(
+	handle: AcpProviderHandle,
+	first: { model: Model<Api>; sessionId?: string },
+	second: { model: Model<Api>; sessionId?: string },
+) {
+	let started: () => void = () => {};
+	const underWay = new Promise<void>((resolve) => (started = resolve));
+	const slow = (async () => {
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of handle.provider.streamSimple(first.model, userContext("SLOW one"), first.sessionId ? { sessionId: first.sessionId } : {})) {
+			events.push(event);
+			if (event.type === "thinking_delta") started();
+		}
+		started();
+		return events.at(-1);
+	})();
+	await underWay;
+	const echo = (await collect(handle.provider.streamSimple(second.model, userContext("ECHO two"), second.sessionId ? { sessionId: second.sessionId } : {}))).at(-1);
+	return { slow: await slow, echo };
+}
+
+test("concurrent streams on two agents both complete with their own output", async () => {
+	const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+	const [fake, other] = handle.provider.getModels();
+	assert.ok(fake && other);
+	const { slow, echo } = await overlapping(handle, { model: fake }, { model: other });
+	assert.ok(slow?.type === "done", `the first stream ends with ${slow?.type}`);
+	assert.match(messageText(slow.message), /Hello world #0/);
+	assert.doesNotMatch(messageText(slow.message), /ECHO/);
+	assert.ok(echo?.type === "done");
+	assert.match(messageText(echo.message), /ECHO\[sess-1\]<<<.*ECHO two/s);
+});
+
+test("concurrent streams on two conversations of one agent run in separate sessions", async () => {
+	const handle = makeProvider();
+	const model = firstModel(handle);
+	const { slow, echo } = await overlapping(handle, { model, sessionId: "conv-a" }, { model, sessionId: "conv-b" });
+	assert.ok(slow?.type === "done", `the first stream ends with ${slow?.type}`);
+	assert.match(messageText(slow.message), /Hello world #0/);
+	assert.doesNotMatch(messageText(slow.message), /ECHO/);
+	assert.ok(echo?.type === "done");
+	const echoSession = /ECHO\[(sess-\d+)\]<<<.*ECHO two/s.exec(messageText(echo.message))?.[1];
+	assert.ok(echoSession);
+	const again = (await collect(handle.provider.streamSimple(model, userContext("ECHO three"), { sessionId: "conv-a" }))).at(-1);
+	assert.ok(again?.type === "done");
+	const slowSession = /ECHO\[(sess-\d+)\]/.exec(messageText(again.message))?.[1];
+	assert.ok(slowSession);
+	assert.notEqual(slowSession, echoSession, "each conversation keeps its own ACP session");
+});
+
+test("each agent's session gets Pi's instructions even when session ids collide", async () => {
+	const handle = makeProvider([fakeAgent(), fakeAgent({ id: "other", name: "Other agent" })]);
+	const [fake, other] = handle.provider.getModels();
+	assert.ok(fake && other);
+	const messages: Message[] = [{ role: "user", content: [{ type: "text", text: "ECHO hi" }], timestamp: Date.now() }];
+	const context = normalizeContext({ systemPrompt: "Be brief.", messages });
+	for (const model of [fake, other]) {
+		const last = (await collect(handle.provider.streamSimple(model, context, {}))).at(-1);
+		assert.ok(last?.type === "done");
+		assert.match(messageText(last.message), /ECHO\[sess-1\]<<<.*<system-instructions>/s, `${model.id} gets the system prompt`);
+	}
+});
+
 test("a tool call reported already completed renders its result", async () => {
 	const handle = makeProvider();
 	const last = await lastEvent(handle, "ONESHOT go");

@@ -73,6 +73,16 @@ test("session is created once and reused", async () => {
 	assert.notEqual(await client.ensureSession(), first, "a used session is replaced");
 });
 
+test("each conversation has its own session, reset on its own", async () => {
+	const client = makeClient();
+	const [a, b] = await Promise.all([client.ensureSession({ conversation: "a" }), client.ensureSession({ conversation: "b" })]);
+	assert.notEqual(a, b);
+	for (const sessionId of [a, b]) await client.prompt({ sessionId, payload: promptPayload(sessionId, "use it"), onUpdate: () => {} });
+	client.resetSession(process.cwd(), "a");
+	assert.notEqual(await client.ensureSession({ conversation: "a" }), a, "the reset conversation gets a new session");
+	assert.equal(await client.ensureSession({ conversation: "b" }), b, "the other conversation keeps its session");
+});
+
 test("spec-shaped session updates stream in order and the turn finishes", async () => {
 	const client = makeClient();
 	const { result, updates, reply } = await runPrompt(client, "do the thing");
