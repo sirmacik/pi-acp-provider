@@ -153,6 +153,7 @@ test("a cancelled prompt's late updates, permission requests and MCP calls stay 
 	assert.doesNotMatch(text, /LATE-CHUNK/);
 	assert.match(text, /LAG<<<permission=cancelled;mcp=rejected>>>/);
 	assert.deepEqual(asked, []);
+	assert.deepEqual((await handle.commands("fake")).map((command) => command.name), ["context", "session"]);
 });
 
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {

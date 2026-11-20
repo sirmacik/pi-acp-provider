@@ -586,7 +586,10 @@ export class AcpClient {
 			const session = conn.sessions.get(sessionId);
 			const config = session && parseConfigOptionUpdate(params, session.config);
 			if (session && config) session.config = config;
-			const commands = parseAvailableCommands(params);
+			// WHY: a draining prompt's command list is late output of a cancelled turn, so it must not
+			// replace the one the next prompt sees. Config updates are still taken: they report the
+			// agent's actual settings, which the next prompt re-applies anyway.
+			const commands = this.drains.has(sessionId) ? null : parseAvailableCommands(params);
 			if (commands) conn.commands.set(sessionId, commands);
 		}
 		const turn = this.turns.get(sessionId);

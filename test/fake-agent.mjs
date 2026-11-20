@@ -34,8 +34,8 @@
  *   - FAKE_MCP_CANCEL=1  cancels that MCP call after 50ms (`notifications/cancelled`) and ends the
  *                   turn with "AGENT-WENT-ON CALL<<<what the call returned>>>"
  *   - FAKE_MCP_GIVEUP=1  ends the turn after 50ms without waiting for the call
- *   - FAKE_CANCEL_LAG=<ms>  after session/cancel, sends a chunk "LATE-CHUNK", a permission
- *                   request and an MCP echo call, waits <ms>, then answers `cancelled`; the next
+ *   - FAKE_CANCEL_LAG=<ms>  after session/cancel, sends a chunk "LATE-CHUNK", a command list
+ *                   with only "late", a permission request and an MCP echo call, waits <ms>, then answers `cancelled`; the next
  *                   ECHO adds "LAG<<<permission=<outcome>;mcp=<rejected|accepted:...|none>>>>"
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
  *   - FAKE_SYSPROMPT=1   advertises sessionCapabilities.systemPrompt
@@ -197,6 +197,7 @@ async function lagThenCancel(turn) {
 	const { sessionId } = turn;
 	await sleep(10);
 	update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "LATE-CHUNK" } });
+	update(sessionId, { sessionUpdate: "available_commands_update", availableCommands: [{ name: "late", description: "Late command list" }] });
 	const response = await serverRequest("session/request_permission", {
 		sessionId,
 		toolCall: { toolCallId: "late", title: "late tool" },
