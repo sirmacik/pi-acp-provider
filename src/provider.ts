@@ -373,7 +373,7 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 			stream.push({ type: "error", reason, error: message });
 		});
 
-	return { append, toolUse, done, fail };
+	return { message, append, toolUse, done, fail };
 }
 
 type MessageWriter = ReturnType<typeof createMessageWriter>;
@@ -484,6 +484,12 @@ interface SyncState {
 	 * sent again while no own reply follows it.
 	 */
 	seeded: Set<string>;
+	/**
+	 * The newest reply the session streamed to an end Pi keeps in context, and the users delivered by then.
+	 * Unlike `anchor`, it covers the latest reply, so a fork that keeps an earlier one is still seen.
+	 * WHY: `error` replies are left out because Pi omits a retried one from context; `aborted` ones it keeps.
+	 */
+	lastStreamed: { timestamp: number; users: readonly string[] } | undefined;
 	/** The Pi system prompt the session last received. */
 	systemPrompt: string;
 }
@@ -955,6 +961,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				ours: new Set(),
 				delivered: new Set(),
 				seeded: new Set(),
+				lastStreamed: undefined,
 				systemPrompt: promptInSession ? systemPrompt : "",
 			};
 			sync.set(sessionId, state);
@@ -1076,15 +1083,27 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	/**
-	 * Whether Pi's history no longer holds what the session saw: its newest reply
-	 * seen there is gone (a tree jump or fork to an earlier point) or the first
-	 * message changed (compaction). Messages an extension adds for one request
-	 * only do not count, since they are never the session's replies.
+	 * Whether Pi's history no longer holds what the session saw: the first message
+	 * changed (compaction), or a tree jump or fork dropped the session's latest
+	 * reply, a user delivered before it, or the anchor. Messages an extension adds
+	 * for one request only do not count, since they are never the session's replies.
 	 */
 	function diverged(state: SyncState, messages: readonly Message[]): boolean {
 		if (state.first !== undefined && messages[0] && messageKey(messages[0]) !== state.first) return true;
-		if (state.anchor === undefined) return false;
-		return !messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === state.anchor);
+		const hasReply = (timestamp: number): boolean =>
+			messages.some((candidate) => candidate.role === "assistant" && candidate.timestamp === timestamp);
+		if (state.anchor !== undefined && !hasReply(state.anchor)) return true;
+		if (state.lastStreamed === undefined) return false;
+		if (!hasReply(state.lastStreamed.timestamp)) return true;
+		const keys = new Set(messages.map(messageKey));
+		return state.lastStreamed.users.some((key) => !keys.has(key));
+	}
+
+	/** Records the turn's settled Pi message as the session's latest reply, if Pi keeps it in context. */
+	function noteStreamed(turn: LiveTurn, message: AssistantMessage): void {
+		const state = sync.get(turn.sessionId);
+		if (!state?.ownStamps.has(message.timestamp) || message.stopReason === "error") return;
+		state.lastStreamed = { timestamp: message.timestamp, users: [...state.delivered] };
 	}
 
 	/** Whether the messages Pi added answer tool calls of `turn`, so the same ACP turn goes on. */
@@ -1324,6 +1343,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			ended = true;
 			turn.attached = null;
 			writer.toolUse(toolCall);
+			noteStreamed(turn, writer.message);
 		};
 		const consume = (event: TurnEvent): void => {
 			if (ended) return;
@@ -1366,6 +1386,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				}
 			} else if (outcome.result.kind === "aborted") writer.fail("aborted", "Request was aborted");
 			else finishTurn(writer, turn.agent, outcome.result.stopReason, turn.usage);
+			noteStreamed(turn, writer.message);
 		};
 		while (turn.buffer.length > 0 && !ended) consume(turn.buffer.shift()!);
 		if (ended) return;

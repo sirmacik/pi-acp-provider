@@ -143,9 +143,10 @@ Global keys:
   them), plus a `<conversation-history>` transcript of any part of Pi's
   history the session missed (a resumed or forked Pi session, another
   model's turns, a branch the session did not see). When Pi's history no
-  longer holds the session's latest reply (tree navigation to an earlier
-  point) or its first message changed (compaction), the provider starts a new
-  ACP session from Pi's history.
+  longer holds the session's latest reply, including an aborted one, or a user
+  message the session got before it (tree navigation or a fork to an earlier
+  point, even one that keeps an earlier reply), or its first message changed
+  (compaction), the provider starts a new ACP session from Pi's history.
 - **Pi's tools**: Pi's current tools are served by an MCP server inside Pi,
   as the server `pi` (`mcp__pi__<tool>` in Claude Code). A call ends the Pi
   message with a real Pi tool call; Pi runs it and the result answers the

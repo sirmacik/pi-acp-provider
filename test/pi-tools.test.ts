@@ -484,6 +484,57 @@ test("a continued conversation sends only the new message; a rewritten one start
 	assert.match(branched, /<conversation-history>[\s\S]*ECHO one/);
 });
 
+const sessionOf = (message: AssistantMessage) => /ECHO\[(.+?)\]/.exec(textOf(message))?.[1];
+
+test("a fork that keeps an earlier reply but drops the latest one starts a new session seeded up to the fork", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const second = await step(handle, messages);
+	assert.equal(sessionOf(second), sessionOf(first));
+	const forked = await capture(handle, [...messages.slice(0, 2), user("ECHO three")]);
+	assert.equal(forked.message.stopReason, "stop");
+	assert.notEqual(sessionOf(forked.message), sessionOf(first));
+	assert.match(forked.prompt, /^<conversation-history>[\s\S]*ECHO one[\s\S]*<\/conversation-history>\nECHO three$/);
+	assert.doesNotMatch(forked.prompt, /ECHO two/);
+});
+
+test("a fork that drops an aborted latest reply and its user starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("SLOW two"));
+	messages.push(await abortAtText(handle, messages));
+	const forked = await capture(handle, [...messages.slice(0, 2), user("ECHO three")]);
+	assert.equal(forked.message.stopReason, "stop");
+	assert.notEqual(sessionOf(forked.message), sessionOf(first));
+	assert.doesNotMatch(forked.prompt, /SLOW two/);
+});
+
+test("a context edit that drops a user the session got before its latest reply starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const second = await step(handle, messages);
+	const edited = await capture(handle, [...messages.slice(0, 2), second, user("ECHO three")]);
+	assert.equal(edited.message.stopReason, "stop");
+	assert.notEqual(sessionOf(edited.message), sessionOf(first));
+});
+
+test("compaction, which replaces the first message, starts a new session", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one")];
+	const first = await step(handle, messages);
+	messages.push(first, user("ECHO two"));
+	const second = await step(handle, messages);
+	const compacted = await capture(handle, [user("summary of the conversation so far"), second, user("ECHO three")]);
+	assert.equal(compacted.message.stopReason, "stop");
+	assert.notEqual(sessionOf(compacted.message), sessionOf(first));
+	assert.match(compacted.prompt, /^<conversation-history>[\s\S]*summary of the conversation so far[\s\S]*<\/conversation-history>\nECHO three$/);
+});
+
 test("steering reaches the running turn with _session/steering before the tool result", async () => {
 	const handle = makeProvider([agent({ env: { FAKE_STEERING: "1" } })]);
 	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"}')];
