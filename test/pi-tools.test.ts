@@ -370,6 +370,25 @@ test("a used session opened while Pi's MCP server was down is replaced, with Pi'
 	assert.equal(info.mcpServers[0]?.name, "pi", "the new session has Pi's MCP server");
 });
 
+test("another agent's session with the same id does not vouch for a session opened without Pi's tools", { skip: process.platform === "win32" }, async () => {
+	const handle = makeProvider([agent(), agent({ id: "other", name: "Other agent" })]);
+	const run = async (agentId: string, messages: Message[]) => {
+		const target = handle.provider.getModels().find((candidate) => candidate.id === agentId);
+		assert.ok(target);
+		const last = (await collect(handle.provider.streamSimple(target, normalizeContext({ tools: [echoTool], messages })))).at(-1);
+		assert.ok(last?.type === "done", `expected done, got ${JSON.stringify(last)}`);
+		return last.message;
+	};
+	// WHY: one shared first message keeps the sync state the two same-named sessions share from looking diverged.
+	const first = user("SESSIONINFO");
+	const down = await withTmpdir(missingTmpdir(), () => run("fake", [first]));
+	assert.deepEqual(JSON.parse(textOf(down)).mcpServers, []);
+	const other = JSON.parse(textOf(await run("other", [first])));
+	assert.equal(other.mcpServers[0]?.name, "pi", "the other agent's own sess-1 has Pi's tools");
+	const again = await run("fake", [first, down, user("SESSIONINFO")]);
+	assert.equal(JSON.parse(textOf(again)).mcpServers[0]?.name, "pi", "the first agent left its unwired sess-1");
+});
+
 test("http transport falls back to stdio when the agent does not advertise it", async () => {
 	const handle = makeProvider([agent({ mcpTransport: "http" })]);
 	const info = JSON.parse(textOf(await step(handle, [user("SESSIONINFO")])));

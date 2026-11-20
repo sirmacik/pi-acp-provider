@@ -488,8 +488,13 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const nonceSessions = new Map<string, { agentId: string; sessionId: string }>();
 	/** The MCP nonce minted for each `session/new` params object, until the session is bound or fails. */
 	const mintedNonces = new WeakMap<Record<string, unknown>, string>();
-	/** The `SessionSetup.key` (Pi tool wiring) each main-client session was opened with, by session id. */
-	const sessionWiring = new Map<string, string>();
+	/** The `SessionSetup.key` (Pi tool wiring) each main-client session was opened with, by client and session id. */
+	const sessionWiring = new WeakMap<AcpClient, Map<string, string>>();
+	const wiringOf = (client: AcpClient): Map<string, string> => {
+		let wiring = sessionWiring.get(client);
+		if (!wiring) sessionWiring.set(client, (wiring = new Map()));
+		return wiring;
+	};
 	/** The ACP turn in progress; it spans several Pi messages. */
 	let live: LiveTurn | null = null;
 
@@ -550,9 +555,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	/** Forgets an ended session of `agent`'s main client and revokes its MCP nonces. */
-	function endSession(agent: AcpAgentConfig, sessionId: string): void {
+	function endSession(agent: AcpAgentConfig, client: AcpClient, sessionId: string): void {
 		sync.delete(sessionId);
-		sessionWiring.delete(sessionId);
+		wiringOf(client).delete(sessionId);
 		for (const [nonce, owner] of nonceSessions) {
 			if (owner.agentId !== agent.id || owner.sessionId !== sessionId) continue;
 			nonceSessions.delete(nonce);
@@ -560,14 +565,18 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 	}
 
-	const newClient = (agent: AcpAgentConfig, clientCwd: string, onSessionEnd?: (sessionId: string) => void): AcpClient => {
+	const newClient = (
+		agent: AcpAgentConfig,
+		clientCwd: string,
+		onSessionEnd?: (client: AcpClient, sessionId: string) => void,
+	): AcpClient => {
 		const client: AcpClient = new AcpClient({
 			agent,
 			cwd: clientCwd,
 			handshakeTimeoutMs: options.config.handshakeTimeoutMs,
 			cancelGraceMs: options.cancelGraceMs,
 			onServerRequest: (request) => answerServerRequest(agent, client, request),
-			onSessionEnd,
+			onSessionEnd: onSessionEnd && ((sessionId) => onSessionEnd(client, sessionId)),
 			log: log && ((message) => log(`${agent.id}: ${message}`)),
 		});
 		return client;
@@ -578,7 +587,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!client) {
 			// WARN: only the main client reports ended sessions: session ids are unique per process at
 			// best, so an isolated client's ended session could share an id with a live main one.
-			client = newClient(agent, cwd, (sessionId) => endSession(agent, sessionId));
+			client = newClient(agent, cwd, (owner, sessionId) => endSession(agent, owner, sessionId));
 			clients.set(agent.id, client);
 		}
 		return client;
@@ -623,7 +632,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	}
 
 	/** `session/new` params for Pi's tools and system prompt, chosen from what the agent advertises. */
-	function sessionSetup(agent: AcpAgentConfig, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
+	function sessionSetup(agent: AcpAgentConfig, client: AcpClient, server: PiMcpServer | null, systemPrompt: string, onPrompt: () => void): SessionSetup {
 		const key = `pi:mcp=${server && agent.piTools !== "off" ? agent.mcpTransport : "none"}`;
 		return {
 			key,
@@ -648,7 +657,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				return params;
 			},
 			settled: (params, sessionId) => {
-				if (sessionId !== undefined) sessionWiring.set(sessionId, key);
+				if (sessionId !== undefined) wiringOf(client).set(sessionId, key);
 				const nonce = mintedNonces.get(params);
 				if (nonce === undefined) return;
 				mintedNonces.delete(params);
@@ -750,12 +759,12 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		try {
 			const server = await mcpServer(agent);
 			let promptInSession = false;
-			const setup = sessionSetup(agent, server, systemPrompt, () => (promptInSession = true));
+			const setup = sessionSetup(agent, acp, server, systemPrompt, () => (promptInSession = true));
 			sessionId = await acp.ensureSession({ signal, setup });
 			let known = sync.get(sessionId);
 			// WHY: the client keeps a used session whatever its key, so one opened while Pi's MCP server was
 			// down would never gain Pi's tools; a new session seeded from Pi's history does.
-			const rewired = sessionWiring.get(sessionId) !== setup.key;
+			const rewired = wiringOf(acp).get(sessionId) !== setup.key;
 			if (rewired || (known && diverged(known, messages))) {
 				log?.(
 					rewired
@@ -1335,7 +1344,6 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			clients.clear();
 			sync.clear();
 			nonceSessions.clear();
-			sessionWiring.clear();
 			mcp?.dispose();
 			mcp = null;
 		},
