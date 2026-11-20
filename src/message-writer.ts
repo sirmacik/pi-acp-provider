@@ -129,7 +129,6 @@ export type FailTurnOptions = {
 	notice?: string | undefined;
 };
 
-/** Ends the message after a thrown error, as an abort when the request was aborted. */
 export function failTurn(writer: MessageWriter, error: unknown, { aborted, agent, auth, notice }: FailTurnOptions): void {
 	if (aborted) {
 		writer.fail("aborted", "Request was aborted");
