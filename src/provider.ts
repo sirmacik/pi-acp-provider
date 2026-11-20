@@ -231,8 +231,8 @@ function plainText(message: UserMessage): string {
 	return message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 }
 
-/** Put in front of steers that reach the agent with a later prompt than the one they were sent during. */
-const LATE_STEER_NOTE = "Delivered late: the user sent the following while you worked on an earlier request, and it did not reach you then.";
+/** Put in front of user messages that reach the agent with a later prompt than the one meant to carry them. */
+const LATE_STEER_NOTE = "Delivered late: the user sent the following earlier, and it did not reach you then.";
 
 /** First line of tool output, capped so huge outputs don't flood the transcript. */
 function summarize(text: string, max = 200): string {
@@ -266,32 +266,45 @@ interface PromptPart {
 	/** The blocks as sent, fixed before an `onPayload` hook can change them. */
 	sent: string[];
 	record: () => void;
+	/** What the prompt leaving the part out means, once the agent accepts it. */
+	omit: () => void;
 	/** Key of the pending steer the part carries. */
 	steer: string | undefined;
 }
 
-function promptPart(blocks: AcpContentBlock[], record: () => void, steer?: string): PromptPart {
-	return { blocks, sent: blocks.map((block) => JSON.stringify(block)), record, steer };
+function promptPart(blocks: AcpContentBlock[], record: () => void, options: { omit?: () => void; steer?: string } = {}): PromptPart {
+	return { blocks, sent: blocks.map((block) => JSON.stringify(block)), record, omit: options.omit ?? (() => {}), steer: options.steer };
 }
 
 /**
  * The parts whose blocks all reach the agent in `payload`, which an `onPayload` hook may have replaced
- * or changed. WARN: a part a hook rewrote counts as not sent, so its content is sent again next time.
+ * or changed. A block the hook kept is recognized as the same object, unchanged. A block it rebuilt is
+ * matched by value, but only when no other block of the prompt has that value, since it cannot tell
+ * which of two identical blocks it stands for.
+ * WARN: a part a hook rewrote, or an ambiguous one, counts as not sent: wrongly sending again is
+ * recoverable, wrongly recording delivery loses the content.
  */
 function partsIn(parts: readonly PromptPart[], payload: unknown): PromptPart[] {
-	const prompt = isRecord(payload) && Array.isArray(payload.prompt) ? payload.prompt : [];
-	const available = new Map<string, number>();
+	const prompt: unknown[] = isRecord(payload) && Array.isArray(payload.prompt) ? payload.prompt : [];
+	const ours = new Set<unknown>(parts.flatMap((part) => part.blocks));
+	const kept = new Set<unknown>();
+	const rebuilt = new Map<string, number>();
 	for (const block of prompt) {
-		const text = JSON.stringify(block);
-		available.set(text, (available.get(text) ?? 0) + 1);
+		if (ours.has(block)) kept.add(block);
+		else {
+			const text = JSON.stringify(block);
+			rebuilt.set(text, (rebuilt.get(text) ?? 0) + 1);
+		}
 	}
-	return parts.filter((part) => {
-		const needed = new Map<string, number>();
-		for (const text of part.sent) needed.set(text, (needed.get(text) ?? 0) + 1);
-		for (const [text, count] of needed) if ((available.get(text) ?? 0) < count) return false;
-		for (const [text, count] of needed) available.set(text, (available.get(text) ?? 0) - count);
-		return true;
-	});
+	const owners = new Map<string, number>();
+	for (const text of parts.flatMap((part) => part.sent)) owners.set(text, (owners.get(text) ?? 0) + 1);
+	return parts.filter((part) =>
+		part.blocks.every((block, index) => {
+			const text = part.sent[index]!;
+			if (kept.has(block)) return JSON.stringify(block) === text;
+			return owners.get(text) === 1 && rebuilt.get(text) === 1;
+		}),
+	);
 }
 
 /**
@@ -576,7 +589,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/** The ACP turn in progress; it spans several Pi messages. */
 	let live: LiveTurn | null = null;
 	/**
-	 * Steers the agent has not accepted yet, oldest first, by agent id. Kept here rather than in a
+	 * Steers the agent has not accepted yet, and users an `onPayload` hook left out of an accepted prompt,
+	 * oldest first, by agent id. Kept here rather than in a
 	 * `SyncState`, so they outlive a replaced or re-seeded session and reach its next prompt.
 	 * TODO(ticket-011): key them by conversation once sessions are.
 	 */
@@ -901,7 +915,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		}
 		if (late.length > 0) parts.push(promptPart([{ type: "text", text: LATE_STEER_NOTE }], () => {}));
 		for (const steer of late) {
-			parts.push(promptPart(userBlocks(steer.message, info.capabilities.image), () => deliverSteers(agent.id, state, [steer.key]), steer.key));
+			const record = (): void => deliverSteers(agent.id, state, [steer.key]);
+			parts.push(promptPart(userBlocks(steer.message, info.capabilities.image), record, { steer: steer.key }));
 		}
 		const sendable = users.filter((user) => !isHeld(user));
 		const fresh = sendable.filter((user) => !state.delivered.has(messageKey(user)));
@@ -912,7 +927,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 		for (const user of sentUsers) {
-			parts.push(promptPart(userBlocks(user, info.capabilities.image), () => state.delivered.add(messageKey(user))));
+			// WHY: once the agent answers, a user the hook left out falls behind the reply and would reach the
+			// next prompt only as history; held, it goes as a late user block instead.
+			const omit = (): void => holdSteers(agent.id, [user]);
+			parts.push(promptPart(userBlocks(user, info.capabilities.image), () => state.delivered.add(messageKey(user)), { omit }));
 		}
 		const blocks = parts.flatMap((part) => part.blocks);
 
@@ -936,7 +954,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 			return;
 		}
 		const commit = (): void => {
-			for (const part of sent) part.record();
+			for (const part of parts) (sent.includes(part) ? part.record : part.omit)();
 			const newestOwn = history.findLast((candidate) => isOwnReply(state, candidate));
 			if (newestOwn) state.anchor = newestOwn.timestamp;
 			state.first = messages[0] ? messageKey(messages[0]) : undefined;

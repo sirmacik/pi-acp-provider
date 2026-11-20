@@ -177,7 +177,8 @@ Global keys:
   hook failed on, is sent in full again with the next request, its user
   messages as requests even when Pi keeps the failed reply. Content an
   `onPayload` hook removes or rewrites counts as not sent, so it goes with
-  the next prompt.
+  the next prompt: a user message as a late user block, like a steer. When a
+  hook rebuilds blocks and two of them are identical, neither counts as sent.
 - **Isolated requests**: compaction and branch summaries (`cacheRetention:
   "none"`) run in a separate, throwaway agent process, so the live session
   is not touched. They get no Pi tools, and when the agent has

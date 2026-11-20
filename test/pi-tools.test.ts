@@ -338,12 +338,12 @@ test("a steer after the agent's own tool call is sent as the next prompt once th
 
 const LATE_STEER = /^Delivered late: [^\n]*\nSTEER-LATE\n/;
 
-/** Runs the agent's own tool turn of `first`, then queues the steer "STEER-LATE" behind it. */
-async function queueSteer(handle: AcpProviderHandle, first: string): Promise<Message[]> {
+/** Runs the agent's own tool turn of `first`, then queues the steer `steer` behind it. */
+async function queueSteer(handle: AcpProviderHandle, first: string, steer: string | Message = "STEER-LATE"): Promise<Message[]> {
 	const messages: Message[] = [user(first)];
 	const reply = await step(handle, messages);
 	assert.equal(reply.stopReason, "toolUse");
-	messages.push(reply, ...(await answerTools(handle, reply)), user("STEER-LATE"));
+	messages.push(reply, ...(await answerTools(handle, reply)), typeof steer === "string" ? user(steer) : steer);
 	return messages;
 }
 
@@ -487,15 +487,14 @@ type Payload = { sessionId: string; prompt: { type: string; text?: string }[] };
  * One provider call that records the prompt text it sends, after `hook` (an `onPayload` that may throw
  * or change the payload); returns the final message, whatever its end.
  */
-async function capture(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, hook?: (payload: Payload) => void) {
+async function capture(handle: AcpProviderHandle, messages: Message[], systemPrompt?: string, hook?: (payload: Payload) => Payload | void) {
 	const prompts: string[] = [];
 	const context = normalizeContext({ ...(systemPrompt ? { systemPrompt } : {}), tools: [echoTool], messages });
 	const options = {
 		onPayload: (payload: unknown) => {
-			hook?.(payload as Payload);
-			const blocks = (payload as Payload).prompt;
-			prompts.push(blocks.map((block) => block.text ?? `[${block.type}]`).join("\n"));
-			return undefined;
+			const final = hook?.(payload as Payload) ?? (payload as Payload);
+			prompts.push(final.prompt.map((block) => block.text ?? `[${block.type}]`).join("\n"));
+			return final === payload ? undefined : final;
 		},
 	};
 	const last = (await collect(handle.provider.streamSimple(model(handle), context, options))).at(-1);
@@ -571,6 +570,74 @@ test("a kept failed reply with nothing to show adds no history seed", async () =
 	const retry = await capture(handle, messages);
 	assert.equal(retry.message.stopReason, "stop");
 	assert.equal(retry.prompt, "ECHO first\nECHO second");
+});
+
+/**
+ * A pending steer "ECHO same" with an image, then a request whose new user message has the same text
+ * block: the image tells the two apart in what the agent gets next.
+ */
+async function identicalSteerAndUser(handle: AcpProviderHandle): Promise<Message[]> {
+	const steer: Message = {
+		role: "user",
+		content: [
+			{ type: "text", text: "ECHO same" },
+			{ type: "image", data: "aGk=", mimeType: "image/png" },
+		],
+		timestamp: ++clock,
+	};
+	const messages = await queueSteer(handle, "MAXTOKENS work", steer);
+	const ended = await step(handle, messages);
+	assert.equal(ended.stopReason, "length");
+	messages.push(ended, user("ECHO same"));
+	return messages;
+}
+
+/** The prompt without the late note and without the first of its identical "ECHO same" blocks. */
+function withoutFirstSame(prompt: Payload["prompt"]): Payload["prompt"] {
+	const first = prompt.findIndex((block) => block.text === "ECHO same");
+	return prompt.filter((block, index) => index !== first && !/^Delivered late/.test(block.text ?? ""));
+}
+
+test("a hook that keeps one of two identical blocks leaves the removed steer pending", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await identicalSteerAndUser(handle);
+	const stripped = await capture(handle, messages, undefined, (payload) => {
+		payload.prompt.splice(0, payload.prompt.length, ...withoutFirstSame(payload.prompt));
+	});
+	assert.equal(stripped.prompt, "[image]\nECHO same");
+	assert.equal(stripped.message.stopReason, "stop");
+	messages.push(stripped.message, user("ECHO again"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\nECHO same\n\[image\]\nECHO again$/, "only the steer is sent again");
+});
+
+test("a hook that rebuilds one of two identical blocks keeps the ambiguous steer pending", async () => {
+	const handle = makeProvider([agent({ piTools: "off" })], { nativeTools: () => true });
+	const messages = await identicalSteerAndUser(handle);
+	const rebuilt = await capture(handle, messages, undefined, (payload) => ({
+		sessionId: payload.sessionId,
+		prompt: withoutFirstSame(payload.prompt).map((block) => ({ ...block })),
+	}));
+	assert.equal(rebuilt.prompt, "[image]\nECHO same");
+	messages.push(rebuilt.message, user("ECHO again"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\nECHO same\n\[image\]\n/, "the ambiguous steer stays pending");
+	assert.doesNotMatch(next.prompt, /conversation-history/);
+});
+
+test("a user message a hook left out of an answered prompt reaches the next one as a user block", async () => {
+	const handle = makeProvider([agent()]);
+	const messages: Message[] = [user("ECHO one"), user("two")];
+	const partial = await capture(handle, messages, undefined, (payload) => {
+		payload.prompt.splice(0, payload.prompt.length, ...payload.prompt.filter((block) => block.text !== "two"));
+	});
+	assert.equal(partial.prompt, "ECHO one");
+	assert.equal(partial.message.stopReason, "stop");
+	messages.push(partial.message, user("ECHO three"));
+	const next = await capture(handle, messages);
+	assert.match(next.prompt, /^Delivered late: [^\n]*\ntwo\nECHO three$/);
+	messages.push(next.message, user("ECHO four"));
+	assert.equal((await capture(handle, messages)).prompt, "ECHO four");
 });
 
 test("content an onPayload hook removes from the prompt is sent again with the next one", async () => {
