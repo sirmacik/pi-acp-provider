@@ -69,16 +69,12 @@ export function parseModelId(id: string, agents: ReadonlyMap<string, AcpAgentCon
 	return owner ? { agent: owner, modelId: id.slice(slash + 1) } : undefined;
 }
 
-/**
- * The provider's model catalogue (discovery, persisted catalogue, reported windows) and the switch of a
- * session to a chosen model and thinking level.
- */
 export function createModelCatalog(
-	options: { config: AcpProviderConfig; log?: ((message: string) => void) | undefined },
+	options: { config: AcpProviderConfig },
 	agents: ReadonlyMap<string, AcpAgentConfig>,
 	getClient: (agent: AcpAgentConfig) => AcpClient,
+	log: ((message: string) => void) | undefined,
 ) {
-	const { log } = options;
 	/** Each agent's models from discovery (or the persisted catalog); default model only until then. */
 	const discovered = new Map<string, Model<Api>[]>();
 	/** The context window each model's agent last reported in `usage_update.size`, by Pi model id. */

@@ -399,7 +399,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const { log } = options;
 	const policy: PermissionPolicy = options.permissionPolicy ?? (async (request) => autoApprove(request));
 	const agents = new Map(options.config.agents.map((agent) => [agent.id, agent]));
-	const { reportedWindows, getModels, refreshModels, applySettings } = createModelCatalog(options, agents, (agent) => getClient(agent));
+	const { reportedWindows, getModels, refreshModels, applySettings } = createModelCatalog(options, agents, (agent) => getClient(agent), log);
 	let cwd = process.cwd();
 	/** One client (and agent process) per agent, spawned on first use. */
 	const clients = new Map<string, AcpClient>();
