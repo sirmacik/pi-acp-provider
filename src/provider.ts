@@ -578,6 +578,21 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		};
 	}
 
+	/**
+	 * `session/new` params for an isolated request: no Pi tools, and the agent's own tools off whenever it has
+	 * a switch for them, whatever `piTools` says, because a summary needs no tools (adr-002: fail closed).
+	 * WARN: agents without `ownToolsOffMeta` (Codex) keep their built-in tools here; ACP has no generic switch.
+	 */
+	function isolatedSetup(agent: AcpAgentConfig): SessionSetup {
+		return {
+			key: "isolated",
+			params: () => {
+				const meta = agent.ownToolsOffMeta ? deepMerge(agent.sessionMeta ?? {}, agent.ownToolsOffMeta) : agent.sessionMeta;
+				return meta && Object.keys(meta).length > 0 ? { _meta: meta } : {};
+			},
+		};
+	}
+
 	/** Whether the session produced `message`, or already received it. */
 	function isOwn(state: SyncState, message: Message): boolean {
 		if (message.role === "assistant") return message.provider === ACP_PROVIDER_ID && state.ownStamps.has(message.timestamp);
@@ -1040,7 +1055,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const signal = streamOptions.signal;
 		const client = newClient(agent, cwd);
 		try {
-			const sessionId = await client.ensureSession({ signal });
+			const sessionId = await client.ensureSession({ signal, setup: isolatedSetup(agent) });
 			await applySettings(client, agent, sessionId, modelId, model, streamOptions);
 			const info = client.info ?? (await client.ensureReady(signal));
 			const blocks: AcpContentBlock[] = [];

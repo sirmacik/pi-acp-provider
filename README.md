@@ -164,7 +164,10 @@ Global keys:
   running one ends. The running turn is not cancelled.
 - **Isolated requests**: compaction and branch summaries (`cacheRetention:
   "none"`) run in a separate, throwaway agent process, so the live session
-  is not touched. Cache-warming requests are answered without contacting the
+  is not touched. They get no Pi tools, and when the agent has
+  `ownToolsOffMeta` (the `claude-agent-acp` preset) it is sent on that
+  session whatever `piTools` says, so the summary cannot run the agent's own
+  tools either. Cache-warming requests are answered without contacting the
   agent.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
   maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other
@@ -213,6 +216,9 @@ Global keys:
 - No ACP client capabilities (`fs`, `terminal`) are offered, so agents use
   their own file and terminal tools. Other agent→client requests get
   method-not-found.
+- Agents without an `ownToolsOffMeta` switch keep their built-in tools in
+  isolated summary requests. This includes Codex (`codex-acp`), which has no
+  documented ACP setting that turns them off.
 - A context window the agent reports does not change the running Pi
   session: Pi reads the window from the selected model, which it replaces
   only when a model is selected or the provider is registered. The reported

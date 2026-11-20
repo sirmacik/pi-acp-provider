@@ -12,7 +12,7 @@ import type {
 	Api,
 } from "@earendil-works/pi-ai";
 import { createAcpProvider, type AcpProviderOptions, type AcpProviderHandle } from "../src/provider.ts";
-import type { AcpAgentConfig } from "../src/config.ts";
+import { AGENT_PRESETS, type AcpAgentConfig } from "../src/config.ts";
 import { toToolResult, type AcpToolDetails } from "../src/native-tools.ts";
 
 const fakePath = fileURLToPath(new URL("./fake-agent.mjs", import.meta.url));
@@ -195,6 +195,33 @@ test("a persisted reported window survives rediscovery", async () => {
 		publish: async ({ update }) => (update?.(), true),
 	});
 	assert.equal(firstModel(handle).contextWindow, 200_000);
+});
+
+async function isolatedSessionParams(agent: AcpAgentConfig) {
+	const handle = makeProvider([agent]);
+	const last = (await collect(handle.provider.streamSimple(firstModel(handle), userContext("SESSIONINFO"), { cacheRetention: "none" }))).at(-1);
+	assert.ok(last?.type === "done");
+	return JSON.parse(messageText(last.message)) as { mcpServers: unknown[]; _meta?: unknown };
+}
+
+test("an isolated request runs with the agent's own tools off when its preset can turn them off", async () => {
+	const claude = AGENT_PRESETS["claude-agent-acp"];
+	assert.ok(claude?.ownToolsOffMeta && claude.sessionMeta);
+	const params = await isolatedSessionParams(
+		fakeAgent({ piTools: "pi", sessionMeta: claude.sessionMeta, ownToolsOffMeta: claude.ownToolsOffMeta }),
+	);
+	assert.deepEqual(params.mcpServers, []);
+	assert.deepEqual(params._meta, {
+		claudeCode: { options: { allowedTools: ["mcp__pi"], tools: [], strictMcpConfig: true } },
+	});
+});
+
+test("an isolated request keeps the session params of an agent without a tools switch", async () => {
+	const codex = AGENT_PRESETS["codex-acp"];
+	assert.ok(codex && codex.ownToolsOffMeta === undefined);
+	const params = await isolatedSessionParams(fakeAgent({ piTools: codex.piTools ?? "both", ownToolsOffMeta: codex.ownToolsOffMeta }));
+	assert.deepEqual(params.mcpServers, []);
+	assert.equal(params._meta, undefined);
 });
 
 test("without usage_update the turn's summed usage is reported unchanged", async () => {
