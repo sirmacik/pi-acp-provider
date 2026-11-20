@@ -322,12 +322,12 @@ test("a Pi-named permission request on a session without Pi's MCP server goes to
 	assert.deepEqual(asked, ["mcp__pi__echo"]);
 });
 
-test("a Pi-named permission request from an isolated request goes to the policy", async () => {
+test("a Pi-named permission request from an isolated request is rejected without asking the policy", async () => {
 	const asked: string[] = [];
 	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked);
 	const message = await step(handle, [user("PERMISSION summarize")], undefined, { cacheRetention: "none" });
-	assert.match(textOf(message), /\[approved=allow\]/);
-	assert.deepEqual(asked, ["rm -rf build"]);
+	assert.match(textOf(message), /\[approved=deny\]/);
+	assert.deepEqual(asked, []);
 });
 
 test("an unrecognized report of a Pi tool call that Pi mirrors does not block the call", async () => {

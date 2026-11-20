@@ -59,6 +59,7 @@ import {
 	RPC_INVALID_PARAMS,
 	RPC_METHOD_NOT_FOUND,
 	autoApprove,
+	autoReject,
 	isRecord,
 	parsePermissionRequest,
 	structuredToolIdentities,
@@ -613,6 +614,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const answerServerRequest = async (
 		agent: AcpAgentConfig,
 		client: AcpClient,
+		isolated: boolean,
 		{ method, params, sessionId, signal }: ServerRequest,
 	): Promise<unknown> => {
 		if (method !== "session/request_permission") {
@@ -622,6 +624,9 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!request) throw new AcpRpcError("Malformed session/request_permission params", RPC_INVALID_PARAMS);
 		// A cancelled turn must answer every pending permission request with `cancelled`.
 		if (signal?.aborted) return { outcome: { outcome: "cancelled" } };
+		// WHY: a summary needs no tools and Pi shows none of an isolated session's calls, so nothing there is
+		// granted (adr-002); this is the only guard for agents without `ownToolsOffMeta` (Codex).
+		if (isolated) return { outcome: autoReject(request) };
 		// Pi's own tools pass Pi's approval when Pi runs them, so the agent's check is redundant.
 		if (isPiToolPermission(agent, client, sessionId, params)) return { outcome: autoApprove(request) };
 		const outcome = await policy(request, { agent, signal });
@@ -681,14 +686,16 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	const newClient = (
 		agent: AcpAgentConfig,
 		clientCwd: string,
-		onSessionEnd?: (client: AcpClient, sessionId: string) => void,
+		role: { isolated: true } | { onSessionEnd: (client: AcpClient, sessionId: string) => void },
 	): AcpClient => {
+		const isolated = "isolated" in role;
+		const onSessionEnd = "onSessionEnd" in role ? role.onSessionEnd : undefined;
 		const client: AcpClient = new AcpClient({
 			agent,
 			cwd: clientCwd,
 			handshakeTimeoutMs: options.config.handshakeTimeoutMs,
 			cancelGraceMs: options.cancelGraceMs,
-			onServerRequest: (request) => answerServerRequest(agent, client, request),
+			onServerRequest: (request) => answerServerRequest(agent, client, isolated, request),
 			onSessionEnd: onSessionEnd && ((sessionId) => onSessionEnd(client, sessionId)),
 			log: log && ((message) => log(`${agent.id}: ${message}`)),
 		});
@@ -700,7 +707,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		if (!client) {
 			// WARN: only the main client reports ended sessions: session ids are unique per process at
 			// best, so an isolated client's ended session could share an id with a live main one.
-			client = newClient(agent, cwd, (owner, sessionId) => endSession(agent, owner, sessionId));
+			client = newClient(agent, cwd, { onSessionEnd: (owner, sessionId) => endSession(agent, owner, sessionId) });
 			clients.set(agent.id, client);
 		}
 		return client;
@@ -784,7 +791,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	 * `session/new` params for an isolated request: no Pi tools, and the agent's own tools off whenever it has
 	 * a switch for them, whatever `piTools` says, because a summary needs no tools (adr-002: fail closed).
 	 * WARN: agents without `ownToolsOffMeta` (Codex) get the bare params isolated sessions always had, without
-	 * `sessionMeta`, and keep their built-in tools; ACP has no generic switch.
+	 * `sessionMeta`, and keep their built-in tools; ACP has no generic switch. Their permission requests are
+	 * still rejected in `answerServerRequest`, but a tool the agent runs without asking is not stopped.
 	 */
 	function isolatedSetup(agent: AcpAgentConfig): SessionSetup {
 		return {
@@ -1401,7 +1409,7 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		streamOptions: StreamOptions,
 	): Promise<void> {
 		const signal = streamOptions.signal;
-		const client = newClient(agent, cwd);
+		const client = newClient(agent, cwd, { isolated: true });
 		try {
 			const sessionId = await client.ensureSession({ signal, setup: isolatedSetup(agent) });
 			await applySettings(client, agent, sessionId, modelId, model, streamOptions);

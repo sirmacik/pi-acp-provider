@@ -395,6 +395,33 @@ test("a rejecting permission policy reaches the agent", async () => {
 	assert.deepEqual(seen, ["fake:rm -rf build"]);
 });
 
+for (const [label, env, expected] of [
+	["rejected", {}, /\[approved=deny\]/],
+	["cancelled when it offers no reject option", { FAKE_PERMISSION_NO_REJECT: "1" }, /\[approved=cancelled\]/],
+] as const) {
+	test(`a permission request from an isolated request of an agent without a tools switch is ${label}, without the policy`, async () => {
+		const codex = AGENT_PRESETS["codex-acp"];
+		assert.ok(codex && codex.ownToolsOffMeta === undefined);
+		const seen: string[] = [];
+		const handle = makeProvider([fakeAgent({ piTools: codex.piTools ?? "both", ownToolsOffMeta: undefined, env })], {
+			permissionPolicy: async (request) => {
+				seen.push(request.title);
+				return { outcome: "selected", optionId: "allow" };
+			},
+		});
+		const last = (
+			await collect(handle.provider.streamSimple(firstModel(handle), userContext("PERMISSION summarize"), { cacheRetention: "none" }))
+		).at(-1);
+		assert.ok(last?.type === "done");
+		assert.match(messageText(last.message), expected);
+		assert.deepEqual(seen, []);
+		const live = await lastEvent(handle, "PERMISSION ask");
+		assert.ok(live?.type === "done");
+		assert.match(messageText(live.message), /\[approved=allow\]/, "live sessions still ask the policy");
+		assert.deepEqual(seen, ["rm -rf build"]);
+	});
+}
+
 test("aborting while a permission prompt is open answers it as cancelled", async () => {
 	const controller = new AbortController();
 	let policySignal: AbortSignal | undefined;
