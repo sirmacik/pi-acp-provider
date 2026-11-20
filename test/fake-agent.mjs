@@ -42,7 +42,11 @@
  *                   each such lingering prompt sends, on its own session, a chunk "STALE-CHUNK", a
  *                   permission request and an MCP echo call over that client; the next ECHO adds
  *                   "STALE<<<permission=<outcome>;mcp=<rejected|accepted:...|pending|none>>>>"
- *   - FAKE_FAIL_SESSION_N=<n>  the nth session/new of this process fails with an internal error
+ *   - "IGNORE-CANCEL"  in a prompt: that prompt alone behaves as under FAKE_IGNORE_CANCEL
+ *   - "BADSESSIONPERM"  asks two permission requests, one without a sessionId and one with a
+ *                   numeric one, and replies "BADPERM<<<missing=<outcome>;number=<outcome>>>>"
+ *   - FAKE_FAIL_SESSION_N=<n>  the nth session/new of this process fails with an internal error,
+ *                   after FAKE_FAIL_SESSION_DELAY=<ms> (default 0)
  *   - FAKE_ORPHAN=<file>  at start, spawns a child in the agent's process group that ignores
  *                   SIGTERM and writes its pid to <file> (POSIX only)
  *   - FAKE_MCP_HTTP=1    advertises HTTP MCP support
@@ -279,6 +283,7 @@ async function handlePrompt(message) {
 	await sendStaleTraffic();
 	const text = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
 	const turn = {
+		ignoreCancel: IGNORE_CANCEL || text.includes("IGNORE-CANCEL"),
 		sessionId,
 		finished: false,
 		/** Set by session/cancel: the turn stops its scripted steps. */
@@ -360,6 +365,18 @@ async function handlePrompt(message) {
 			content: { type: "text", text: `TOOLS<<<${tools.map((entry) => entry.name).join(",")}>>> RESULT<<<${resultText}>>>${extra}` },
 		});
 		promptCounter++;
+		return turn.finish("end_turn");
+	}
+	if (text.includes("BADSESSIONPERM")) {
+		const ask = async (sessionField) =>
+			(await serverRequest("session/request_permission", {
+				...sessionField,
+				toolCall: { toolCallId: "bad", title: "bad session" },
+				options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+			})).result?.outcome?.outcome ?? "error";
+		const missing = await ask({});
+		const number = await ask({ sessionId: 42 });
+		update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `BADPERM<<<missing=${missing};number=${number}>>>` } });
 		return turn.finish("end_turn");
 	}
 	if (text.includes("AUTH")) return replyError(message.id, -32000, "Authentication required");
@@ -466,7 +483,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			break;
 		case "session/new":
 			if (!authenticated) replyError(message.id, -32000, "Authentication required");
-			else if (++sessionNewCounter === Number(process.env.FAKE_FAIL_SESSION_N)) replyError(message.id, -32603, "fake session/new failure");
+			else if (++sessionNewCounter === Number(process.env.FAKE_FAIL_SESSION_N)) {
+				const { id } = message;
+				setTimeout(() => replyError(id, -32603, "fake session/new failure"), Number(process.env.FAKE_FAIL_SESSION_DELAY ?? 0));
+			}
 			else {
 				const sessionId = `sess-${++sessionCounter}`;
 				sessionParams.set(sessionId, message.params);
@@ -517,7 +537,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			const running = activePrompts.get(message.params?.sessionId);
 			if (!running || running.finished) break;
 			running.cancelled = true;
-			if (IGNORE_CANCEL) linger(running);
+			if (running.ignoreCancel) linger(running);
 			else if (CANCEL_LAG > 0) void lagThenCancel(running);
 			else running.finish("cancelled");
 			break;

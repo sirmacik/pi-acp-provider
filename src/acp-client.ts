@@ -130,6 +130,10 @@ interface Connection {
 	commands: Map<string, AcpCommand[]>;
 	/** Sessions of this process that ended; their traffic is dropped or answered `cancelled`. */
 	ended: Set<string>;
+	/** Whether the next session opened replaces one whose cancelled prompt never answered. */
+	replacing: boolean;
+	/** The `session` promise opened while `replacing`, until it settles. */
+	replacement: Promise<string> | null;
 }
 
 export interface EnsureSessionOptions {
@@ -268,7 +272,7 @@ export class AcpClient {
 	/** Drain timeouts in a row; a drain that ends in time, or a restart, resets it. */
 	private drainTimeouts = 0;
 	/** A drain-timeout recovery in progress; concurrent `ensureSession` calls share it. */
-	private recovery: Promise<boolean> | null = null;
+	private recovery: Promise<void> | null = null;
 
 	constructor(options: AcpClientOptions) {
 		this.options = options;
@@ -297,7 +301,7 @@ export class AcpClient {
 	async ensureSession(options: EnsureSessionOptions = {}): Promise<string> {
 		const { signal, authenticate = true, setup } = options;
 		this.recovery ??= this.recoverDrain().finally(() => (this.recovery = null));
-		const replaced = await abortable(this.recovery, signal);
+		await abortable(this.recovery, signal);
 		const info = await this.ensureReady(signal);
 		const conn = this.conn;
 		if (!conn) throw new Error(`${this.options.agent.name} is not running`);
@@ -308,25 +312,39 @@ export class AcpClient {
 			const params = setup?.params(info) ?? {};
 			const session: Promise<string> = this.newSession(conn, authenticate, params).then(
 				(sessionId) => {
+					if (conn.replacement === session) conn.replacement = null;
 					setup?.settled?.(params, sessionId);
 					return sessionId;
 				},
 				(error: unknown) => {
 					setup?.settled?.(params, undefined);
 					if (conn.session === session) conn.session = null;
+					// WHY: decided here, on the shared operation, so the restart happens even when every
+					// caller waiting on this session has aborted. An agent that cannot open the session
+					// replacing a stuck one is not trusted to recover by itself.
+					if (conn.replacement === session) {
+						conn.replacement = null;
+						if (this.conn === conn && !this.disposed) {
+							this.log(`new session after a drain timeout failed (${errorText(error)}); restarting the agent`);
+							this.close(conn, new Error("restarted after a drain timeout"));
+						}
+					}
 					throw error;
 				},
 			);
 			conn.session = session;
+			if (conn.replacing) {
+				conn.replacing = false;
+				conn.replacement = session;
+			}
 		}
+		const session = conn.session;
+		const replacement = conn.replacement === session;
 		try {
-			return await abortable(conn.session, signal);
+			return await abortable(session, signal);
 		} catch (error) {
-			if (!replaced || signal?.aborted || this.disposed) throw error;
-			// WHY: an agent that cannot open the session replacing a stuck one is not trusted to recover
-			// by itself; a fresh process is the remaining remedy, tried once.
-			this.log(`new session after a drain timeout failed (${errorText(error)}); restarting the agent`);
-			if (this.conn === conn) this.close(conn, new Error("restarted after a drain timeout"));
+			// The failed replacement restarted the agent; the session is retried once on the new process.
+			if (!replacement || signal?.aborted || this.disposed) throw error;
 			return this.ensureSession(options);
 		}
 	}
@@ -334,29 +352,27 @@ export class AcpClient {
 	/**
 	 * Waits for the current session's cancelled prompt, if any. When it does not answer within the
 	 * cancel grace, rejects it and ends the session so the next one starts clean; on the second
-	 * timeout in a row restarts the process instead. Resolves true when the session was replaced.
+	 * timeout in a row restarts the process instead.
 	 */
-	private async recoverDrain(): Promise<boolean> {
+	private async recoverDrain(): Promise<void> {
 		const conn = this.conn;
 		const sessionId = await conn?.session?.catch(() => undefined);
 		const drain = sessionId === undefined ? undefined : this.drains.get(sessionId);
-		if (!conn || sessionId === undefined || !drain) return false;
-		if (await drain.settled) {
-			this.drainTimeouts = 0;
-			return false;
-		}
-		if (this.conn !== conn || this.drains.get(sessionId) !== drain) return false;
+		if (!conn || sessionId === undefined || !drain) return;
+		// A drain that ends in time resets the timeout streak where it settles (in `prompt`).
+		if (await drain.settled) return;
+		if (this.conn !== conn || this.drains.get(sessionId) !== drain) return;
 		this.drains.delete(sessionId);
 		this.pending.get(drain.requestId)?.reject(new Error("The cancelled prompt did not end in time"));
 		this.drainTimeouts++;
 		if (this.drainTimeouts >= MAX_DRAIN_TIMEOUTS) {
 			this.log(`session ${sessionId} ignored session/cancel again; restarting the agent`);
 			this.close(conn, new Error("restarted after repeated drain timeouts"));
-		} else {
-			this.log(`session ${sessionId} ignored session/cancel; starting a new session`);
-			this.dropSession(conn);
+			return;
 		}
-		return true;
+		this.log(`session ${sessionId} ignored session/cancel; starting a new session`);
+		this.dropSession(conn);
+		conn.replacing = true;
 	}
 
 	/** Forgets the current session and ends it once it exists, so its traffic is refused. */
@@ -375,7 +391,11 @@ export class AcpClient {
 		conn.ended.add(sessionId);
 		conn.sessions.delete(sessionId);
 		conn.commands.delete(sessionId);
-		this.drains.delete(sessionId);
+		const drain = this.drains.get(sessionId);
+		if (drain) {
+			this.drains.delete(sessionId);
+			this.pending.get(drain.requestId)?.reject(new Error(`Session ${sessionId} ended before its cancelled prompt did`));
+		}
 		this.turns.delete(sessionId);
 		try {
 			this.options.onSessionEnd?.(sessionId);
@@ -484,7 +504,9 @@ export class AcpClient {
 					// WARN: a timed-out drain stays in `drains` (its session's traffic is still refused) until
 					// `recoverDrain` replaces the session.
 					void drain.settled.then((inTime) => {
-						if (inTime && this.drains.get(sessionId) === drain) this.drains.delete(sessionId);
+						if (!inTime || this.drains.get(sessionId) !== drain) return;
+						this.drains.delete(sessionId);
+						this.drainTimeouts = 0;
 					});
 					resolve({ kind: "aborted" });
 				};
@@ -576,6 +598,8 @@ export class AcpClient {
 			sessions: new Map(),
 			commands: new Map(),
 			ended: new Set(),
+			replacing: false,
+			replacement: null,
 		};
 		this.conn = conn;
 		track(proc);
@@ -719,9 +743,9 @@ export class AcpClient {
 		const sessionId = isRecord(params) && typeof params.sessionId === "string" ? params.sessionId : undefined;
 		const live = sessionId !== undefined && this.conn?.sessions.has(sessionId) === true;
 		// WHY: a cancelled prompt must answer its permission requests `cancelled`; while it drains,
-		// the session has no current prompt whose signal could say so. An ended or unknown session
-		// has no prompt Pi could approve anything for.
-		if (method === "session/request_permission" && sessionId !== undefined && (!live || this.drains.has(sessionId))) {
+		// the session has no current prompt whose signal could say so. An ended, unknown or missing
+		// session has no prompt Pi could approve anything for.
+		if (method === "session/request_permission" && (!live || this.drains.has(sessionId))) {
 			this.write({ jsonrpc: "2.0", id, result: { outcome: { outcome: "cancelled" } } });
 			return;
 		}

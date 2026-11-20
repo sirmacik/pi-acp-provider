@@ -125,12 +125,12 @@ test("abort sends session/cancel and keeps the session usable", async () => {
 });
 
 /** Starts a SLOW prompt on the current session and aborts it at its first update. */
-async function cancelSlowPrompt(client: AcpClient): Promise<string> {
+async function cancelSlowPrompt(client: AcpClient, text = "SLOW work"): Promise<string> {
 	const sessionId = await client.ensureSession();
 	const controller = new AbortController();
 	const result = await client.prompt({
 		sessionId,
-		payload: promptPayload(sessionId, "SLOW work"),
+		payload: promptPayload(sessionId, text),
 		signal: controller.signal,
 		onUpdate: () => controller.abort(),
 	});
@@ -177,6 +177,63 @@ test("a new session that fails after a drain timeout restarts the agent", async 
 	assert.notEqual(client.info?.name, firstPid);
 	const { result } = await runPrompt(client, "ECHO again");
 	assert.equal(result.kind, "finished");
+});
+
+test("a replacement session that fails after its caller aborted still restarts the agent", async () => {
+	const client = makeClient({
+		agent: { env: { FAKE_IGNORE_CANCEL: "1", FAKE_FAIL_SESSION_N: "2", FAKE_FAIL_SESSION_DELAY: "500" } },
+		cancelGraceMs: 200,
+	});
+	const firstPid = (await client.ensureReady()).name;
+	await cancelSlowPrompt(client);
+	const controller = new AbortController();
+	const waiting = client.ensureSession({ signal: controller.signal });
+	// After the 200 ms drain timeout, while the replacement session/new is still pending.
+	await sleep(350);
+	controller.abort();
+	await assert.rejects(waiting, /aborted/);
+	await sleep(400);
+	await client.ensureSession();
+	assert.notEqual(client.info?.name, firstPid, "the failed replacement restarted the agent");
+});
+
+test("a cancel that drains in time breaks the drain-timeout streak", async () => {
+	const client = makeClient({ cancelGraceMs: 200 });
+	const firstPid = (await client.ensureReady()).name;
+	const first = await cancelSlowPrompt(client, "SLOW IGNORE-CANCEL");
+	const second = await cancelSlowPrompt(client);
+	assert.notEqual(second, first);
+	// The timely drain settles before anything waits on it.
+	await sleep(100);
+	assert.equal(await cancelSlowPrompt(client, "SLOW IGNORE-CANCEL"), second);
+	const third = await client.ensureSession();
+	assert.notEqual(third, second, "the second ignored cancel gets a new session");
+	assert.equal(client.info?.name, firstPid, "not a restart: a timely drain came between the timeouts");
+});
+
+test("ending a session while its cancel drains rejects the cancelled prompt", async () => {
+	const client = makeClient({ agent: { env: { FAKE_IGNORE_CANCEL: "1" } }, cancelGraceMs: 200 });
+	await cancelSlowPrompt(client);
+	client.resetSession(process.cwd());
+	await client.ensureSession();
+	// WHY: white-box, because nothing else observes a request the agent never answers.
+	const pending = (client as unknown as { pending: Map<unknown, unknown> }).pending;
+	assert.equal(pending.size, 0, "the cancelled session/prompt is no longer pending");
+	const { result } = await runPrompt(client, "ECHO after reset");
+	assert.equal(result.kind, "finished");
+});
+
+test("permission requests without a string session id are answered cancelled", async () => {
+	const asked: unknown[] = [];
+	const client = makeClient({
+		onServerRequest: async (request) => {
+			asked.push(request.params);
+			return approveAll(request);
+		},
+	});
+	const { reply } = await runPrompt(client, "BADSESSIONPERM");
+	assert.equal(reply, "BADPERM<<<missing=cancelled;number=cancelled>>>");
+	assert.deepEqual(asked, []);
 });
 
 const isAlive = (pid: number): boolean => {
