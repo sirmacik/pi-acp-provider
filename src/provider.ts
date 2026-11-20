@@ -60,6 +60,7 @@ import {
 	autoApprove,
 	isRecord,
 	parsePermissionRequest,
+	structuredToolIdentities,
 	type AcpAgentInfo,
 	type AcpCommand,
 	type AcpPermissionOutcome,
@@ -319,8 +320,10 @@ interface ToolEntry {
 	/** The mirror tool's arguments, fixed by the first update so the tool row does not change. */
 	args: AcpToolArgs | undefined;
 	rawInput: unknown;
-	/** The agent's structured tool name (ACP `name` or Claude's `_meta.claudeCode.toolName`), never the title. */
-	toolName: string | undefined;
+	/** Every structured identity the agent's reports of this call carried (`structuredToolIdentities`), never the title. */
+	identities: unknown[];
+	/** The status the agent last reported; `state.status` can also be set by Pi's handoff of a call it runs. */
+	reportedStatus: AcpToolState["status"];
 	/** Whether a Pi message already shows this call as a tool row. */
 	mirrored: boolean;
 	/** A call to Pi's MCP server: Pi shows and runs it as its own tool call, so it is not mirrored. */
@@ -519,9 +522,10 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 	/**
 	 * Whether a permission request is for a call of Pi's own tool, judged by structure only (adr-001): it
 	 * comes from the main client on the live turn's session, which holds a bound MCP nonce, and names a
-	 * tool call that session reported and has not finished; its structured names (the request's and the
-	 * report's) all name one and the same tool Pi serves.
-	 * WARN: titles, `piOwned` and `mirrored` are display state an agent or a tool's input can steer; never use them here.
+	 * tool call the agent reported and has not reported finished; every structured identity of the request
+	 * and of the call's reports names one and the same tool Pi serves.
+	 * WARN: titles, `piOwned`, `mirrored` and `state` are display state an agent or a tool's input can steer;
+	 * never use them here.
 	 */
 	function isPiToolPermission(agent: AcpAgentConfig, client: AcpClient, sessionId: string | undefined, params: unknown): boolean {
 		const turn = live;
@@ -540,11 +544,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 		const toolCall = isRecord(params) && isRecord(params.toolCall) ? params.toolCall : undefined;
 		const id = typeof toolCall?.toolCallId === "string" ? toolCall.toolCallId : undefined;
 		const entry = id === undefined ? undefined : turn.tools.get(id);
-		if (!toolCall || !entry || entry.state.status === "completed" || entry.state.status === "failed") return false;
-		const meta = isRecord(toolCall._meta) && isRecord(toolCall._meta.claudeCode) ? toolCall._meta.claudeCode : undefined;
-		const asked = typeof toolCall.name === "string" ? toolCall.name : typeof meta?.toolName === "string" ? meta.toolName : undefined;
+		if (!toolCall || !entry || entry.reportedStatus === "completed" || entry.reportedStatus === "failed") return false;
 		const tools = new Set(
-			[asked, entry.toolName].flatMap((name) => (name === undefined ? [] : [PI_TOOL_NAME.exec(name)?.[1] ?? null])),
+			[...structuredToolIdentities(toolCall), ...entry.identities].map((identity) =>
+				typeof identity === "string" ? (PI_TOOL_NAME.exec(identity)?.[1] ?? null) : null,
+			),
 		);
 		const [tool, ...others] = tools;
 		return (
@@ -978,7 +982,8 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 					title: undefined,
 					args: undefined,
 					rawInput: undefined,
-					toolName: undefined,
+					identities: [],
+					reportedStatus: undefined,
 					mirrored: false,
 					piOwned: false,
 					state: { status: undefined, content: { text: [], diffs: [], terminals: [] }, rawOutput: undefined },
@@ -987,11 +992,11 @@ export function createAcpProvider(options: AcpProviderOptions): AcpProviderHandl
 				turn.tools.set(event.toolCallId, entry);
 			}
 			if (event.title) entry.title = event.title;
-			if (event.status) entry.state.status = event.status;
+			if (event.status) entry.state.status = entry.reportedStatus = event.status;
 			if (event.content) entry.state.content = event.content;
 			if (event.rawOutput !== undefined) entry.state.rawOutput = event.rawOutput;
 			if (event.rawInput !== undefined) entry.rawInput = event.rawInput;
-			if (event.toolName) entry.toolName = event.toolName;
+			entry.identities.push(...event.toolIdentities);
 			if (!entry.mirrored && piToolRef(event.toolName, entry.title)) entry.piOwned = true;
 			entry.args ??= {
 				agent: turn.agent.id,

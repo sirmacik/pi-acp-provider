@@ -161,11 +161,12 @@ Global keys:
   without asking, since Pi applies its own approval when it runs the tool,
   but only when its structure shows it is one: it comes from the running
   turn's session, which holds a live MCP nonce, it names a tool call that
-  session reported and has not finished, and the structured tool name (ACP
-  `name`, or Claude Code's `_meta.claudeCode.toolName`, on the request and on
-  the reported call, whichever are present) names one and the same tool Pi
-  serves, such as `mcp__pi__read`. Titles, and whether the call is shown as
-  an `acp_tool` row, are never trusted. Every other request goes to the normal permission policy.
+  the agent reported and has not reported finished, and every structured
+  tool name present (ACP `name` and Claude Code's `_meta.claudeCode.toolName`,
+  on the request and on each report of the call) names one and the same tool
+  Pi serves, such as `mcp__pi__read`. Titles, and how the call is shown in
+  Pi, are never trusted. Every other request goes to the normal permission
+  policy.
   If Pi's MCP server fails to start, an agent with `piTools: "pi"` (the
   `claude-agent-acp` preset) ends the turn with an error naming Pi's tool
   server instead of running with its built-in tools; a `piTools: "both"`

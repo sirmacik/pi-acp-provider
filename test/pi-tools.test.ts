@@ -260,6 +260,7 @@ test("a structurally named Pi tool call shown as a native row is approved withou
 for (const [label, env] of [
 	["the permission request's structured name", { FAKE_PERMISSION_NAME: "mcp__pi__echo" }],
 	["the structured name the tool call was reported with", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_TITLE: "Echo" }],
+	["both structured fields of the request, agreeing", { FAKE_PERMISSION_NAME: "mcp__pi__echo", FAKE_PERMISSION_META_NAME: "mcp__pi__echo" }],
 ] as const) {
 	test(`a live Pi tool call named by ${label} is approved without the policy`, async () => {
 		const asked: string[] = [];
@@ -273,6 +274,8 @@ for (const [label, env, title] of [
 	["titled only", {}, "mcp__pi__echo"],
 	["named for a tool Pi does not serve", { FAKE_PERMISSION_NAME: "mcp__pi__rm" }, "mcp__pi__echo"],
 	["named unlike its tool call", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_PERMISSION_NAME: "Bash" }, "mcp__pi__echo"],
+	["whose ACP name and Claude tool name disagree", { FAKE_PERMISSION_NAME: "mcp__pi__echo", FAKE_PERMISSION_META_NAME: "Bash" }, "mcp__pi__echo"],
+	["whose call was reported with disagreeing ACP and Claude tool names", { FAKE_MCP_NAME: "mcp__pi__echo", FAKE_MCP_META_NAME: "Bash" }, "mcp__pi__echo"],
 ] as const) {
 	test(`a permission request for a Pi tool call ${label} goes to the policy`, async () => {
 		const asked: string[] = [];
@@ -281,6 +284,27 @@ for (const [label, env, title] of [
 		assert.deepEqual(asked, [title]);
 	});
 }
+
+test("a pending call whose waiting row Pi's handoff of another call ended is still approved by its structured name", async () => {
+	const asked: string[] = [];
+	const handle = recordingProvider({ FAKE_PERMISSION_NAME: "mcp__pi__echo" }, asked, {}, { nativeTools: () => true });
+	const messages: Message[] = [user('MCPCALL:echo:{"text":"hi"} OVERLAP')];
+	const rows: string[] = [];
+	for (let index = 0; index < 5; index++) {
+		const message = await step(handle, messages);
+		messages.push(message);
+		if (message.stopReason !== "toolUse") {
+			assert.match(textOf(message), /OVERLAPPERM<<<allow>>> TOOLS<<<echo>>> RESULT<<<echoed hi>>>/);
+			assert.match(rows[0] ?? "", /Handed to Pi as echo/, "the handoff ended r1's row with a synthetic status");
+			assert.deepEqual(asked, []);
+			return;
+		}
+		const results = await answerTools(handle, message);
+		for (const result of results) if (result.role === "toolResult" && result.toolName === "acp_tool") rows.push(JSON.stringify(result.content));
+		messages.push(...results);
+	}
+	assert.fail("the turn did not end");
+});
 
 test("a Pi-looking permission request without a reported, pending tool call goes to the policy", async () => {
 	const asked: string[] = [];

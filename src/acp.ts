@@ -87,6 +87,8 @@ export type AcpSessionUpdate =
 			title: string | undefined;
 			/** The agent's internal tool name, when it sends one (`name`, or Claude's `_meta.claudeCode.toolName`). */
 			toolName: string | undefined;
+			/** Every structured identity the update carries, for authorization (see `structuredToolIdentities`). */
+			toolIdentities: unknown[];
 			status: ToolCallStatus | undefined;
 			summary: string;
 			/** ACP `ToolKind` (read, edit, execute, ...), when the agent sends one. */
@@ -197,6 +199,16 @@ function claudeToolName(meta: unknown): string | undefined {
 	return isRecord(meta) && isRecord(meta.claudeCode) ? optionalString(meta.claudeCode.toolName) : undefined;
 }
 
+/**
+ * Every structured tool identity a tool call record carries, whatever its type: ACP `name` and Claude's
+ * `_meta.claudeCode.toolName`, in that order, each when present.
+ * WARN: authorization must check all of them; picking one lets a conflicting other field go unseen.
+ */
+export function structuredToolIdentities(record: Record<string, unknown>): unknown[] {
+	const meta = isRecord(record._meta) && isRecord(record._meta.claudeCode) ? record._meta.claudeCode : undefined;
+	return [record.name, meta?.toolName].filter((identity) => identity !== undefined);
+}
+
 export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 	const update = updateOf(params);
 	switch (update?.sessionUpdate) {
@@ -211,6 +223,7 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 				toolCallId: update.toolCallId,
 				title: optionalString(update.title),
 				toolName: optionalString(update.name) ?? claudeToolName(update._meta),
+				toolIdentities: structuredToolIdentities(update),
 				status: oneOf(TOOL_CALL_STATUSES, update.status),
 				summary: toolContentSummary(update.content),
 				kind: optionalString(update.kind),
