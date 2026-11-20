@@ -131,8 +131,9 @@ Global keys:
 
 ## Behavior
 
-- **Lifecycle**: each agent's process spawns lazily on its first prompt,
-  stays alive across prompts, and is killed on session shutdown (`/new`,
+- **Lifecycle**: each agent's process spawns lazily on first use: model
+  discovery (see Models and thinking level) or, when discovery has not run,
+  the first prompt. It stays alive across prompts, and is killed on session shutdown (`/new`,
   `/resume`, quit, reload). Each agent runs in its own process group, so the
   whole tree (including tool subprocesses) is killed. Parent signal hooks,
   shared by all agents, cover exits without a session shutdown. A crashed
@@ -230,8 +231,12 @@ Global keys:
   permission policy. Cache-warming requests are answered without contacting the
   agent.
 - **Streaming**: ACP v1 `session/update` notifications. `agent_thought_chunk`
-  maps to Pi thinking blocks and `agent_message_chunk` to text blocks. Other
-  update kinds (plans, mode changes) are ignored.
+  maps to Pi thinking blocks and `agent_message_chunk` to text blocks.
+  `tool_call` and `tool_call_update` drive tool rows (see Tool calls),
+  `usage_update` records the context window, `config_option_update` tracks
+  the session's model and thinking-level settings, and
+  `available_commands_update` feeds the agent slash commands. Plans and mode
+  changes are ignored.
 - **Tool calls** (`nativeTools`, the default): each agent tool call is a native
   Pi tool row. The provider ends the Pi message at the call with a `toolCall`
   block for the `acp_tool` mirror tool. Pi runs that tool, which waits for the
